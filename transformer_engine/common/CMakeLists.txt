@@ -111,6 +111,7 @@ list(APPEND transformer_engine_SOURCES
      gemm/config.cpp
      gemm/cublaslt_gemm.cu
      gemm/cutlass_grouped_gemm.cu
+     gemm/cublaslt_grouped_gemm.cu
      normalization/common.cpp
      normalization/layernorm/ln_api.cpp
      normalization/layernorm/ln_bwd_semi_cuda_kernel.cu
