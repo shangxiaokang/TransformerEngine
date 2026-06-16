@@ -15,8 +15,10 @@
 
 #include "common/common.h"
 #include "common/recipe/recipe_common.cuh"
+#include "common/transpose/cast_transpose.h"
 #include "common/util/ptx.cuh"
 #include "common/utils.cuh"
+#include "transformer_engine/transpose.h"
 
 #if (!defined(__CUDA_MINIMUM_ARCH__) && __CUDA_ARCH__ >= 900) || \
     (defined(__CUDA_MINIMUM_ARCH__) && __CUDA_MINIMUM_ARCH__ >= 900)
