@@ -16,6 +16,7 @@
 #include "common/common.h"
 #include "common/recipe/recipe_common.cuh"
 #include "common/transpose/cast_transpose.h"
+#include "common/util/cuda_runtime.h"
 #include "common/util/ptx.cuh"
 #include "common/utils.cuh"
 #include "transformer_engine/transpose.h"
@@ -476,6 +477,7 @@ CUtensorMap get_tensor_map(const SimpleTensor& tensor, size_t global_dim_x, size
 }
 
 constexpr int kMaxTensorsPerSquareBlockwiseKernel = 32;
+constexpr int kMaxTensorsPerSquareBlockwiseTmaKernel = 8;
 
 struct MultiSquareBlockwiseQuantizeArgs {
   void* input_list[kMaxTensorsPerSquareBlockwiseKernel];
@@ -490,6 +492,22 @@ struct MultiSquareBlockwiseQuantizeArgs {
   int scale_t_stride_x_list[kMaxTensorsPerSquareBlockwiseKernel];
   int scale_t_stride_y_list[kMaxTensorsPerSquareBlockwiseKernel];
   int block_range[kMaxTensorsPerSquareBlockwiseKernel + 1];
+  int num_tensors;
+};
+
+struct alignas(64) MultiSquareBlockwiseTmaQuantizeArgs {
+  void* input_list[kMaxTensorsPerSquareBlockwiseTmaKernel];
+  void* output_c_list[kMaxTensorsPerSquareBlockwiseTmaKernel];
+  void* output_t_list[kMaxTensorsPerSquareBlockwiseTmaKernel];
+  void* scale_inv_c_list[kMaxTensorsPerSquareBlockwiseTmaKernel];
+  void* scale_inv_t_list[kMaxTensorsPerSquareBlockwiseTmaKernel];
+  alignas(64) CUtensorMap tensor_map_output_t_list[kMaxTensorsPerSquareBlockwiseTmaKernel];
+  int row_length;
+  int num_rows;
+  int scale_stride_x;
+  int scale_stride_y;
+  int scale_t_stride_x;
+  int scale_t_stride_y;
   int num_tensors;
 };
 
@@ -669,6 +687,199 @@ __device__ __forceinline__ void block_scaled_cast_transpose_kernel_notaligned_im
   }
 }
 
+#ifdef TMA_HW_SUPPORTED
+template <typename CType, typename IType, typename OType>
+__device__ __forceinline__ void block_scaled_cast_transpose_kernel_tma_full_tile_impl(
+    const IType* const input, OType* const output_c, CType* const tile_scales_inv_c,
+    CType* const tile_scales_inv_t, const size_t row_length, const size_t num_rows,
+    const size_t scale_stride_x, const size_t scale_stride_y, const size_t scale_t_stride_x,
+    const size_t scale_t_stride_y, const float epsilon, const CUtensorMap* const tensor_map_output_t,
+    bool pow_2_scaling, const size_t tile_id_x, const size_t tile_id_y,
+    CType* const block_tile_amax_shared,
+    Vec<OType, THREAD_TILE_DIM_Y> (*block_tile_trans_shared)[SHARED_BLOCK_TILE_DIM_X_BANKS]) {
+  using IVec = Vec<IType, THREAD_TILE_DIM_X>;
+  using OVecCast = Vec<OType, THREAD_TILE_DIM_X>;
+  using OVecTrans = Vec<OType, THREAD_TILE_DIM_Y>;
+
+  IVec thrd_tile_input[THREAD_TILE_DIM_Y];
+  OVecTrans thrd_tile_out_trans[THREAD_TILE_DIM_X];
+
+  const int tid_in_warp = threadIdx.x % kThreadsPerWarp;
+  const int tid_in_warp_x = tid_in_warp % NUM_THREADS_X_IN_WARP;
+  const int tid_in_warp_y = tid_in_warp / NUM_THREADS_X_IN_WARP;
+  const int warp_id_in_block = threadIdx.x / kThreadsPerWarp;
+  const int warp_id_in_block_x = warp_id_in_block % NUM_WARPS_X_IN_BLOCK;
+  const int warp_id_in_block_y = warp_id_in_block / NUM_WARPS_X_IN_BLOCK;
+
+  const size_t block_tile_start_idx =
+      tile_id_y * BLOCK_TILE_DIM * row_length + tile_id_x * BLOCK_TILE_DIM;
+  const size_t warp_tile_start_idx =
+      block_tile_start_idx +
+      warp_id_in_block_y * THREAD_TILE_DIM_Y * NUM_THREADS_Y_IN_WARP * row_length +
+      warp_id_in_block_x * THREAD_TILE_DIM_X * NUM_THREADS_X_IN_WARP;
+  const size_t thread_tile_start_idx = warp_tile_start_idx +
+                                       tid_in_warp_y * THREAD_TILE_DIM_Y * row_length +
+                                       tid_in_warp_x * THREAD_TILE_DIM_X;
+
+  CType warp_tile_amax;
+  CType block_tile_amax;
+  CType block_tile_scale;
+  CType amax = 0;
+
+#pragma unroll
+  for (int i = 0; i < THREAD_TILE_DIM_Y; i++) {
+    thrd_tile_input[i].load_from(input + thread_tile_start_idx + i * row_length);
+  }
+
+  for (int i = 0; i < THREAD_TILE_DIM_Y; i++) {
+#pragma unroll
+    for (int j = 0; j < THREAD_TILE_DIM_X; j++) {
+      __builtin_assume(amax >= 0);
+      amax = fmaxf(amax, fabsf(static_cast<CType>(thrd_tile_input[i].data.elt[j])));
+    }
+  }
+
+  warp_tile_amax = warp_reduce_max<kThreadsPerWarp>(amax);
+  constexpr int lane_zero = 0;
+  warp_tile_amax = __shfl_sync(0xFFFFFFFF, warp_tile_amax, lane_zero);
+
+  if (tid_in_warp == 0) {
+    block_tile_amax_shared[warp_id_in_block_y * NUM_WARPS_X_IN_BLOCK + warp_id_in_block_x] =
+        warp_tile_amax;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    CType blk_amax = block_tile_amax_shared[0];
+#pragma unroll
+    for (int idx = 1; idx < NUM_WARPS_IN_BLOCK; idx++) {
+      blk_amax = fmaxf(blk_amax, block_tile_amax_shared[idx]);
+    }
+    block_tile_amax_shared[0] = blk_amax;
+  }
+  __syncthreads();
+  block_tile_amax = block_tile_amax_shared[0];
+
+  block_tile_scale =
+      compute_scale_from_types<IType, OType>(block_tile_amax, epsilon, pow_2_scaling);
+
+  if (threadIdx.x == 0) {
+    static_assert(std::is_same<CType, float>::value);
+    const CType scale_inv = 1.0f / block_tile_scale;
+
+    size_t row_idx = tile_id_y;
+    size_t col_idx = tile_id_x;
+    tile_scales_inv_c[row_idx * scale_stride_y + col_idx * scale_stride_x] = scale_inv;
+
+    row_idx = tile_id_x;
+    col_idx = tile_id_y;
+    tile_scales_inv_t[row_idx * scale_t_stride_y + col_idx * scale_t_stride_x] = scale_inv;
+  }
+
+  OVecCast tmp_output_c;
+  for (int i = 0; i < THREAD_TILE_DIM_Y; i++) {
+#pragma unroll
+    for (int j = 0; j < THREAD_TILE_DIM_X; j++) {
+      CType scale_data = block_tile_scale;
+      OType scaled_elt =
+          static_cast<OType>(static_cast<CType>(thrd_tile_input[i].data.elt[j]) * scale_data);
+      tmp_output_c.data.elt[j] = scaled_elt;
+      thrd_tile_out_trans[j].data.elt[i] = scaled_elt;
+    }
+    tmp_output_c.store_to(output_c + thread_tile_start_idx + i * row_length);
+  }
+
+#pragma unroll
+  for (int i = 0; i < THREAD_TILE_DIM_X; i++) {
+    auto warp_id_in_block_x_ = warp_id_in_block_y;
+    auto warp_id_in_block_y_ = warp_id_in_block_x;
+    int row_idx = warp_id_in_block_y_ * THREAD_TILE_DIM_X * NUM_THREADS_X_IN_WARP +
+                  tid_in_warp_x * THREAD_TILE_DIM_X + i;
+    int col_idx =
+        warp_id_in_block_x_ * (NUM_BANKS_Y_IN_WARP / NUM_BANKS_PER_SHARED_ELEM) + tid_in_warp_y;
+    block_tile_trans_shared[row_idx][col_idx] = thrd_tile_out_trans[i];
+  }
+
+  OType(*block_tile_trans_shared_otype_ptr)[BLOCK_TILE_DIM] =
+      reinterpret_cast<OType(*)[BLOCK_TILE_DIM]>(block_tile_trans_shared);
+
+  ptx::fence_proxy_async_shared_cta();
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    ptx::cp_async_bulk_tensor_2d_shared_to_global(
+        reinterpret_cast<const uint64_t*>(tensor_map_output_t), tile_id_y * BLOCK_TILE_DIM,
+        tile_id_x * BLOCK_TILE_DIM,
+        reinterpret_cast<uint64_t*>(block_tile_trans_shared_otype_ptr));
+    ptx::cp_async_bulk_commit_group();
+    ptx::cp_async_bulk_wait_group_read<0>();
+  }
+}
+#endif
+
+template <typename InputType, typename OutputType>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK)
+    multi_block_scaled_square_cast_transpose_tma_kernel(
+        const __grid_constant__ MultiSquareBlockwiseTmaQuantizeArgs args, const float epsilon,
+        bool pow_2_scaling, const float* noop_ptr) {
+  if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
+    return;
+  }
+
+  const int tensor_id = blockIdx.z;
+  if (tensor_id >= args.num_tensors) {
+    return;
+  }
+
+#ifdef TMA_HW_SUPPORTED
+  using OVecTrans = Vec<OutputType, THREAD_TILE_DIM_Y>;
+
+  __shared__ float block_tile_amax_shared[NUM_WARPS_IN_BLOCK];
+  __shared__ alignas(128)
+      OVecTrans block_tile_trans_shared[SHARED_BLOCK_TILE_DIM_Y][SHARED_BLOCK_TILE_DIM_X_BANKS];
+
+  block_scaled_cast_transpose_kernel_tma_full_tile_impl<float, InputType, OutputType>(
+      reinterpret_cast<const InputType*>(args.input_list[tensor_id]),
+      reinterpret_cast<OutputType*>(args.output_c_list[tensor_id]),
+      reinterpret_cast<float*>(args.scale_inv_c_list[tensor_id]),
+      reinterpret_cast<float*>(args.scale_inv_t_list[tensor_id]),
+      static_cast<size_t>(args.row_length), static_cast<size_t>(args.num_rows),
+      static_cast<size_t>(args.scale_stride_x), static_cast<size_t>(args.scale_stride_y),
+      static_cast<size_t>(args.scale_t_stride_x), static_cast<size_t>(args.scale_t_stride_y),
+      epsilon, &args.tensor_map_output_t_list[tensor_id], pow_2_scaling,
+      static_cast<size_t>(blockIdx.x), static_cast<size_t>(blockIdx.y), block_tile_amax_shared,
+      block_tile_trans_shared);
+#else
+  __shared__ float block_tile_amax_shared[NUM_WARPS_IN_BLOCK];
+  block_scaled_cast_transpose_kernel_notaligned_impl<true, float, InputType, OutputType>(
+      reinterpret_cast<const InputType*>(args.input_list[tensor_id]),
+      reinterpret_cast<OutputType*>(args.output_c_list[tensor_id]),
+      reinterpret_cast<OutputType*>(args.output_t_list[tensor_id]),
+      reinterpret_cast<float*>(args.scale_inv_c_list[tensor_id]),
+      reinterpret_cast<float*>(args.scale_inv_t_list[tensor_id]),
+      static_cast<size_t>(args.row_length), static_cast<size_t>(args.num_rows),
+      static_cast<size_t>(args.scale_stride_x), static_cast<size_t>(args.scale_stride_y),
+      static_cast<size_t>(args.scale_t_stride_x), static_cast<size_t>(args.scale_t_stride_y),
+      epsilon, pow_2_scaling, static_cast<size_t>(blockIdx.x), static_cast<size_t>(blockIdx.y),
+      block_tile_amax_shared);
+#endif
+}
+
+template <typename InputType, typename OutputType>
+void launch_multi_block_scaled_square_cast_transpose_tma_kernel(
+    const MultiSquareBlockwiseTmaQuantizeArgs& kernel_args, const float epsilon,
+    const bool pow_2_scaling, const float* noop_ptr, cudaStream_t stream) {
+  if (kernel_args.num_tensors == 0) {
+    return;
+  }
+
+  const dim3 grid(static_cast<unsigned int>(kernel_args.row_length / BLOCK_TILE_DIM),
+                  static_cast<unsigned int>(kernel_args.num_rows / BLOCK_TILE_DIM),
+                  static_cast<unsigned int>(kernel_args.num_tensors));
+  multi_block_scaled_square_cast_transpose_tma_kernel<InputType, OutputType>
+      <<<grid, THREADS_PER_BLOCK, 0, stream>>>(kernel_args, epsilon, pow_2_scaling, noop_ptr);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
+
 template <bool kReturnTranspose, typename CType, typename IType, typename OType>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK)
     multi_block_scaled_square_cast_transpose_kernel(MultiSquareBlockwiseQuantizeArgs args,
@@ -717,6 +928,138 @@ void launch_multi_block_scaled_square_cast_transpose_kernel(
   multi_block_scaled_square_cast_transpose_kernel<kReturnTranspose, float, InputType, OutputType>
       <<<n_blocks, THREADS_PER_BLOCK, 0, stream>>>(kernel_args, epsilon, pow_2_scaling, noop_ptr);
   NVTE_CHECK_CUDA(cudaGetLastError());
+}
+
+bool try_launch_multi_block_scaled_square_cast_transpose_tma(
+    const std::vector<Tensor*>& input_list, std::vector<Tensor*>& output_list,
+    const DType input_dtype, const DType output_dtype, const float epsilon,
+    const bool pow_2_scale, const float* noop_ptr, cudaStream_t stream) {
+  if (cuda::sm_arch(cuda::current_device()) < 90) {
+    return false;
+  }
+
+  size_t common_row_length = 0;
+  size_t common_num_rows = 0;
+  size_t common_scale_stride_y = 0;
+  size_t common_scale_t_stride_y = 0;
+  bool common_shape_initialized = false;
+
+  for (size_t tensor_id = 0; tensor_id < input_list.size(); ++tensor_id) {
+    const auto& input = input_list[tensor_id]->data;
+    auto& output = output_list[tensor_id]->data;
+    auto& output_t = output_list[tensor_id]->columnwise_data;
+    auto& scale_inv = output_list[tensor_id]->scale_inv;
+    auto& scale_inv_t = output_list[tensor_id]->columnwise_scale_inv;
+
+    if (output_list[tensor_id]->scaling_mode != NVTE_BLOCK_SCALING_2D ||
+        input.dtype != input_dtype || output.dtype != output_dtype || input.shape != output.shape ||
+        scale_inv.shape.size() != 2 || output_t.shape.size() != input.shape.size() ||
+        output.dtype != output_t.dtype || scale_inv_t.shape.size() != 2 || output.dptr == nullptr ||
+        output_t.dptr == nullptr || scale_inv.dptr == nullptr || scale_inv_t.dptr == nullptr ||
+        !is_aligned_ptr(output_t.dptr, TMA_GMEM_ALIGNMENT)) {
+      return false;
+    }
+
+    const size_t row_length = input.shape.size() > 0 ? input.shape.at(input.shape.size() - 1) : 1u;
+    size_t num_rows = 1;
+    size_t num_elements = row_length;
+    for (size_t i = 0; (i < input.shape.size() - 1) && (input.shape.size() > 0); ++i) {
+      num_rows *= input.shape.at(i);
+      num_elements *= input.shape.at(i);
+    }
+    if (num_elements == 0 || row_length % BLOCK_TILE_DIM != 0 ||
+        num_rows % BLOCK_TILE_DIM != 0) {
+      return false;
+    }
+
+    if (output_t.shape.size() > 0) {
+      if (output_t.shape[0] != row_length) {
+        return false;
+      }
+      for (size_t i = 1; i < output_t.shape.size(); ++i) {
+        if (output_t.shape.at(i) != input.shape.at(i - 1)) {
+          return false;
+        }
+      }
+    }
+
+    const size_t scale_stride_y = scale_inv.shape[1];
+    const size_t scale_t_stride_y = scale_inv_t.shape[1];
+
+    if (!common_shape_initialized) {
+      common_row_length = row_length;
+      common_num_rows = num_rows;
+      common_scale_stride_y = scale_stride_y;
+      common_scale_t_stride_y = scale_t_stride_y;
+      common_shape_initialized = true;
+    } else if (row_length != common_row_length || num_rows != common_num_rows ||
+               scale_stride_y != common_scale_stride_y ||
+               scale_t_stride_y != common_scale_t_stride_y) {
+      return false;
+    }
+  }
+
+  if (!common_shape_initialized) {
+    return false;
+  }
+
+  auto check_int_range = [](size_t value, const char* name) -> int {
+    NVTE_CHECK(value <= static_cast<size_t>(std::numeric_limits<int>::max()), name,
+               " exceeds int range: ", value);
+    return static_cast<int>(value);
+  };
+
+  TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
+      input_dtype, InputType,
+      TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(
+          output_dtype, OutputType,
+          MultiSquareBlockwiseTmaQuantizeArgs kernel_args{};
+          auto reset_kernel_args = [&]() {
+            kernel_args.num_tensors = 0;
+            kernel_args.row_length = check_int_range(common_row_length, "Row length");
+            kernel_args.num_rows = check_int_range(common_num_rows, "Number of rows");
+            kernel_args.scale_stride_x = 1;
+            kernel_args.scale_stride_y = check_int_range(common_scale_stride_y, "Scale stride y");
+            kernel_args.scale_t_stride_x = 1;
+            kernel_args.scale_t_stride_y =
+                check_int_range(common_scale_t_stride_y, "Scale_t stride y");
+          };
+          auto launch_kernel_args = [&]() {
+            if (kernel_args.num_tensors == 0) {
+              return;
+            }
+            launch_multi_block_scaled_square_cast_transpose_tma_kernel<InputType, OutputType>(
+                kernel_args, epsilon, pow_2_scale, noop_ptr, stream);
+            reset_kernel_args();
+          };
+          reset_kernel_args();
+
+          for (size_t tensor_id = 0; tensor_id < input_list.size(); ++tensor_id) {
+            if (kernel_args.num_tensors == kMaxTensorsPerSquareBlockwiseTmaKernel) {
+              launch_kernel_args();
+            }
+
+            const auto& input = input_list[tensor_id]->data;
+            auto& output = output_list[tensor_id]->data;
+            auto& output_t = output_list[tensor_id]->columnwise_data;
+            auto& scale_inv = output_list[tensor_id]->scale_inv;
+            auto& scale_inv_t = output_list[tensor_id]->columnwise_scale_inv;
+
+            const int pos = kernel_args.num_tensors;
+            kernel_args.input_list[pos] = input.dptr;
+            kernel_args.output_c_list[pos] = output.dptr;
+            kernel_args.output_t_list[pos] = output_t.dptr;
+            kernel_args.scale_inv_c_list[pos] = scale_inv.dptr;
+            kernel_args.scale_inv_t_list[pos] = scale_inv_t.dptr;
+            kernel_args.tensor_map_output_t_list[pos] =
+                get_tensor_map<OutputType>(output_t, common_num_rows, common_row_length);
+            ++kernel_args.num_tensors;
+          }
+
+          launch_kernel_args();)  // OutputType
+  )                              // InputType
+
+  return true;
 }
 
 }  // namespace
@@ -840,6 +1183,13 @@ void multi_quantize_transpose_square_blockwise(
   }
   NVTE_CHECK(output_dtype != DType::kNumTypes, "Unable to infer output dtype.");
   const float* noop_ptr = reinterpret_cast<const float*>(noop_tensor.dptr);
+
+  if (return_transpose &&
+      try_launch_multi_block_scaled_square_cast_transpose_tma(input_list, output_list, input_dtype,
+                                                              output_dtype, epsilon, pow_2_scale,
+                                                              noop_ptr, stream)) {
+    return;
+  }
 
   auto check_int_range = [](size_t value, const char* name) -> int {
     NVTE_CHECK(value <= static_cast<size_t>(std::numeric_limits<int>::max()), name,
