@@ -132,17 +132,17 @@ class _GroupedLinear(torch.autograd.Function):
         weights_fp8: list
         if fp8:
             # FP8 cast to workspace buffer
-            weights_fp8 = []
             update_workspace = is_first_microbatch is None or is_first_microbatch
-            for i in range(num_gemms):
-                weight_fp8 = module.get_weight_workspace(
-                    tensor=weights[i],
-                    quantizer=weight_quantizers[i],
-                    cache_name=(None if is_first_microbatch is None else f"weight{i}"),
-                    update_workspace=update_workspace,
-                    skip_update_flag=skip_fp8_weight_update,
-                )
-                weights_fp8.append(weight_fp8)
+            weights_fp8 = module.get_multi_weight_workspaces(
+                tensors=list(weights),
+                quantizers=weight_quantizers,
+                cache_names=[
+                    None if is_first_microbatch is None else f"weight{i}"
+                    for i in range(num_gemms)
+                ],
+                update_workspace=update_workspace,
+                skip_update_flag=skip_fp8_weight_update,
+            )
 
         else:
             weights_fp8 = [cast_if_needed(weight, activation_dtype) for weight in weights]

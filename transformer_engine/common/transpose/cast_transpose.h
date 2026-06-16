@@ -30,6 +30,11 @@ void quantize_transpose_square_blockwise(const SimpleTensor &input, SimpleTensor
                                          const bool return_transpose, const bool pow_2_scale,
                                          const SimpleTensor &noop_tensor, cudaStream_t stream);
 
+void multi_quantize_transpose_square_blockwise(
+    const std::vector<Tensor *> &input_list, std::vector<Tensor *> &output_list,
+    const float epsilon, const bool return_transpose, const bool pow_2_scale,
+    const SimpleTensor &noop_tensor, cudaStream_t stream);
+
 // enum class for rowwise usage
 enum class FP8BlockwiseRowwiseOption {
   // No rowwise data, skip rowwise quantization

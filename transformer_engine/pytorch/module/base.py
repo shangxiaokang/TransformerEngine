@@ -1326,6 +1326,118 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
     def forward(self):
         """Needs override."""
 
+    def get_multi_weight_workspaces(
+        self,
+        *,
+        tensors: List[torch.Tensor],
+        quantizers: List[Quantizer],
+        cache_names: Optional[List[Optional[str]]] = None,
+        update_workspace: bool = True,
+        skip_update_flag: Optional[torch.Tensor] = None,
+        fsdp_group: Optional[dist_group_type] = None,
+        workspace_dtype: Optional[torch.dtype] = None,
+    ) -> List[QuantizedTensor]:
+        """Get several FP8 weight workspaces and update them with one multi-tensor op when possible."""
+
+        if cache_names is None:
+            cache_names = [None] * len(tensors)
+        if not (len(tensors) == len(quantizers) == len(cache_names)):
+            raise ValueError(
+                "tensors, quantizers, and cache_names must have the same length "
+                f"(got {len(tensors)}, {len(quantizers)}, {len(cache_names)})"
+            )
+
+        def fallback() -> List[QuantizedTensor]:
+            return [
+                self.get_weight_workspace(
+                    tensor=tensor,
+                    quantizer=quantizer,
+                    cache_name=cache_name,
+                    update_workspace=update_workspace,
+                    skip_update_flag=skip_update_flag,
+                    fsdp_group=fsdp_group,
+                    workspace_dtype=workspace_dtype,
+                )
+                for tensor, quantizer, cache_name in zip(tensors, quantizers, cache_names)
+            ]
+
+        if (
+            fsdp_group is not None
+            or workspace_dtype is not None
+            or not tensors
+            or any(isinstance(tensor, QuantizedTensor) for tensor in tensors)
+            or any(not isinstance(quantizer, Float8BlockQuantizer) for quantizer in quantizers)
+            or any(quantizer.block_scaling_dim != 2 for quantizer in quantizers)
+            or any(quantizer.all_gather_usage for quantizer in quantizers)
+        ):
+            return fallback()
+
+        outputs: List[Optional[QuantizedTensor]] = [None] * len(tensors)
+        create_indices: List[int] = []
+        update_indices: List[int] = []
+
+        for i, (tensor, quantizer, cache_name) in enumerate(zip(tensors, quantizers, cache_names)):
+            out = self._fp8_workspaces.get(cache_name, None) if cache_name is not None else None
+
+            if out is not None:
+                reset_cache = False
+                if isinstance(out, Float8TensorBase):
+                    if (
+                        not is_non_tn_fp8_gemm_supported()
+                        and quantizer.columnwise_usage
+                        and out._transpose is None
+                    ):
+                        reset_cache = True
+                elif isinstance(out, MXFP8TensorBase):
+                    if quantizer.rowwise_usage and out._rowwise_data is None:
+                        reset_cache = True
+                    elif quantizer.columnwise_usage and out._columnwise_data is None:
+                        reset_cache = True
+                if isinstance(out, DebugQuantizedTensor) != isinstance(quantizer, DebugQuantizer):
+                    reset_cache = True
+                if reset_cache:
+                    out = None
+                    if cache_name is not None:
+                        del self._fp8_workspaces[cache_name]
+
+            if out is None:
+                create_indices.append(i)
+            else:
+                outputs[i] = out
+                if skip_update_flag is not None or update_workspace:
+                    update_indices.append(i)
+
+        if create_indices:
+            quantizer_internal_values = []
+            for i in create_indices:
+                quantizer = quantizers[i]
+                quantizer_internal_values.append(quantizer.internal)
+                if cache_names[i] is not None:
+                    quantizer.internal = False
+            try:
+                created_outputs = tex.multi_tensor_quantize(
+                    [tensors[i] for i in create_indices],
+                    [quantizers[i] for i in create_indices],
+                )
+            finally:
+                for i, quantizer_internal in zip(create_indices, quantizer_internal_values):
+                    quantizers[i].internal = quantizer_internal
+
+            for i, out in zip(create_indices, created_outputs):
+                outputs[i] = out
+                if cache_names[i] is not None:
+                    self._fp8_workspaces[cache_names[i]] = out
+
+        if update_indices:
+            tex.multi_tensor_quantize_into(
+                [tensors[i] for i in update_indices],
+                [quantizers[i] for i in update_indices],
+                [outputs[i] for i in update_indices],
+                skip_update_flag,
+            )
+
+        return outputs
+
     def get_weight_workspace(
         self,
         *,

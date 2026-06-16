@@ -248,6 +248,11 @@ py::object dequantize(const py::handle &input, DType otype);
 std::vector<py::object> multi_tensor_quantize(const std::vector<at::Tensor> &tensor_list,
                                               std::vector<py::handle> quantizer_list);
 
+std::vector<py::object> multi_tensor_quantize_into(const std::vector<at::Tensor> &tensor_list,
+                                                   std::vector<py::handle> quantizer_list,
+                                                   std::vector<py::handle> output_list,
+                                                   std::optional<at::Tensor> noop_flag);
+
 std::vector<py::object> split_quantize(const at::Tensor &tensor,
                                        const std::vector<int> &split_sections,
                                        std::vector<py::handle> quantizer_list);

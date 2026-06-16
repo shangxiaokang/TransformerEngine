@@ -16,6 +16,7 @@
 #include "../extensions.h"
 #include "common.h"
 #include "pybind.h"
+#include "transformer_engine/transpose.h"
 #include "transformer_engine/transformer_engine.h"
 
 namespace transformer_engine {
@@ -103,7 +104,8 @@ namespace {
 void multi_tensor_quantize_impl(const std::vector<TensorWrapper> &input_list,
                                 std::vector<py::handle> &quantizer_py_list,
                                 std::vector<std::unique_ptr<Quantizer>> &quantizer_cpp_list,
-                                std::vector<TensorWrapper> &output_list) {
+                                std::vector<TensorWrapper> &output_list,
+                                const std::optional<TensorWrapper> &noop_flag = std::nullopt) {
   // Check number of tensors
   const size_t num_tensors = input_list.size();
   NVTE_CHECK(quantizer_py_list.size() == num_tensors, "Expected ", num_tensors,
@@ -112,10 +114,13 @@ void multi_tensor_quantize_impl(const std::vector<TensorWrapper> &input_list,
              " C++ quantizers, but got ", quantizer_cpp_list.size());
   NVTE_CHECK(output_list.size() == num_tensors, "Expected ", num_tensors,
              " output tensors, but got ", output_list.size());
+  if (num_tensors == 0) {
+    return;
+  }
 
   // Choose implementation
   // Note: Currently only have fused kernel for FP8 delayed scaling
-  bool with_fused_kernel = true;
+  bool with_fused_kernel = !noop_flag.has_value();
   for (size_t i = 0; i < num_tensors; i++) {
     if (!detail::IsFloat8Quantizers(quantizer_py_list[i].ptr())) {
       with_fused_kernel = false;
@@ -188,6 +193,9 @@ void multi_tensor_quantize_impl(const std::vector<TensorWrapper> &input_list,
     QuantizationConfigWrapper quant_config;
     quant_config.set_force_pow_2_scales(first_blockwise_quantizer->force_pow_2_scales);
     quant_config.set_amax_epsilon(first_blockwise_quantizer->amax_epsilon);
+    if (noop_flag.has_value()) {
+      quant_config.set_noop_tensor(noop_flag->data());
+    }
     if (first_blockwise_quantizer->all_gather_usage) {
       quant_config.set_float8_block_scale_tensor_format(Float8BlockScaleTensorFormat::COMPACT);
     }
@@ -197,10 +205,69 @@ void multi_tensor_quantize_impl(const std::vector<TensorWrapper> &input_list,
           nvte_tensor_input_list.size(), nvte_tensor_input_list.data(),
           nvte_tensor_output_list.data(), quant_config, at::cuda::getCurrentCUDAStream());
     });
+    return;
+  }
+
+  // Fused kernel for 2D FP8 blockwise multi-tensor quantize. This is mainly used by grouped
+  // weight workspaces where every expert weight has the same quantization configuration.
+  bool with_square_blockwise_fused_kernel = true;
+  Float8BlockQuantizer *first_square_blockwise_quantizer = nullptr;
+  for (size_t i = 0; i < num_tensors; i++) {
+    if (!detail::IsFloat8BlockwiseQuantizers(quantizer_py_list[i].ptr())) {
+      with_square_blockwise_fused_kernel = false;
+      break;
+    }
+
+    auto *blockwise_quantizer = dynamic_cast<Float8BlockQuantizer *>(quantizer_cpp_list[i].get());
+    if (blockwise_quantizer == nullptr ||
+        blockwise_quantizer->get_scaling_mode() != NVTE_BLOCK_SCALING_2D ||
+        !blockwise_quantizer->rowwise_usage || blockwise_quantizer->all_gather_usage) {
+      with_square_blockwise_fused_kernel = false;
+      break;
+    }
+
+    if (i == 0) {
+      first_square_blockwise_quantizer = blockwise_quantizer;
+      continue;
+    }
+
+    if (blockwise_quantizer->dtype != first_square_blockwise_quantizer->dtype ||
+        blockwise_quantizer->force_pow_2_scales !=
+            first_square_blockwise_quantizer->force_pow_2_scales ||
+        blockwise_quantizer->amax_epsilon != first_square_blockwise_quantizer->amax_epsilon ||
+        blockwise_quantizer->rowwise_usage != first_square_blockwise_quantizer->rowwise_usage ||
+        blockwise_quantizer->columnwise_usage !=
+            first_square_blockwise_quantizer->columnwise_usage) {
+      with_square_blockwise_fused_kernel = false;
+      break;
+    }
+  }
+
+  if (with_square_blockwise_fused_kernel && first_square_blockwise_quantizer != nullptr) {
+    std::vector<NVTETensor> nvte_tensor_input_list;
+    std::vector<NVTETensor> nvte_tensor_output_list;
+    for (size_t i = 0; i < num_tensors; ++i) {
+      nvte_tensor_input_list.push_back(input_list[i].data());
+      nvte_tensor_output_list.push_back(output_list[i].data());
+    }
+
+    QuantizationConfigWrapper quant_config;
+    quant_config.set_force_pow_2_scales(first_square_blockwise_quantizer->force_pow_2_scales);
+    quant_config.set_amax_epsilon(first_square_blockwise_quantizer->amax_epsilon);
+    if (noop_flag.has_value()) {
+      quant_config.set_noop_tensor(noop_flag->data());
+    }
+
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_multi_quantize_transpose_square_blockwise(
+          nvte_tensor_input_list.size(), nvte_tensor_input_list.data(),
+          nvte_tensor_output_list.data(), quant_config, at::cuda::getCurrentCUDAStream());
+    });
+    return;
   } else {
     // Quantize kernels individually
     for (size_t i = 0; i < num_tensors; ++i) {
-      quantizer_cpp_list[i]->quantize(input_list[i], output_list[i]);
+      quantizer_cpp_list[i]->quantize(input_list[i], output_list[i], noop_flag);
     }
   }
 }
@@ -242,6 +309,56 @@ std::vector<py::object> multi_tensor_quantize(const std::vector<at::Tensor> &ten
 
   // Perform multi-tensor quantization
   multi_tensor_quantize_impl(input_cpp_list, quantizer_list, quantizer_cpp_list, output_cpp_list);
+
+  return output_py_list;
+}
+
+std::vector<py::object> multi_tensor_quantize_into(const std::vector<at::Tensor> &tensor_list,
+                                                   std::vector<py::handle> quantizer_list,
+                                                   std::vector<py::handle> output_list,
+                                                   std::optional<at::Tensor> noop_flag) {
+  // Check number of tensors
+  const size_t num_tensors = tensor_list.size();
+  NVTE_CHECK(quantizer_list.size() == num_tensors, "Expected ", num_tensors,
+             " quantizers, but got ", quantizer_list.size());
+  NVTE_CHECK(output_list.size() == num_tensors, "Expected ", num_tensors,
+             " output tensors, but got ", output_list.size());
+
+  // Convert quantizers to C++ objects
+  std::vector<std::unique_ptr<Quantizer>> quantizer_cpp_list;
+  for (size_t i = 0; i < num_tensors; i++) {
+    quantizer_cpp_list.push_back(convert_quantizer(quantizer_list[i]));
+  }
+
+  // Initialize input and output tensors
+  std::vector<at::Tensor> input_contiguous_list;
+  std::vector<TensorWrapper> input_cpp_list;
+  std::vector<TensorWrapper> output_cpp_list;
+  std::vector<py::object> output_py_list;
+  input_contiguous_list.reserve(num_tensors);
+  input_cpp_list.reserve(num_tensors);
+  output_cpp_list.reserve(num_tensors);
+  output_py_list.reserve(num_tensors);
+
+  for (size_t i = 0; i < num_tensors; ++i) {
+    input_contiguous_list.emplace_back(tensor_list[i].contiguous());
+    input_cpp_list.emplace_back(makeTransformerEngineTensor(input_contiguous_list.back()));
+
+    py::object output_obj = py::reinterpret_borrow<py::object>(output_list[i]);
+    auto [output_cpp, output_py] = quantizer_cpp_list[i]->convert_and_update_tensor(output_obj);
+    output_cpp_list.emplace_back(std::move(output_cpp));
+    output_py_list.emplace_back(std::move(output_py));
+  }
+
+  // Initialize no-op flag
+  std::optional<TensorWrapper> noop_flag_cpp;
+  if (noop_flag.has_value()) {
+    noop_flag_cpp = makeTransformerEngineTensor(*noop_flag);
+  }
+
+  // Perform multi-tensor quantization
+  multi_tensor_quantize_impl(input_cpp_list, quantizer_list, quantizer_cpp_list, output_cpp_list,
+                             noop_flag_cpp);
 
   return output_py_list;
 }
