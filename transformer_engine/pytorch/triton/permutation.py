@@ -10,7 +10,6 @@ import torch
 import triton
 import triton.language as tl
 
-from triton.language import core
 from triton.language.standard import _log2
 
 
@@ -37,7 +36,10 @@ def _compare_and_swap(x, indices, flip, i: tl.constexpr, n_dims: tl.constexpr):
     l_indice = tl.reshape(tl.broadcast_to(tl.sum(z * (1 - mask), 1)[:, None, :], shape), x.shape)
     r_indice = tl.reshape(tl.broadcast_to(tl.sum(z * mask, 1)[:, None, :], shape), x.shape)
 
-    idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
+    # _argsort is only used for int32 row_id_map values in this file. Calling
+    # core.get_int_dtype here breaks Triton's JIT dependency hashing on some
+    # versions, so keep the dtype explicit.
+    idtype = tl.int32
 
     il_value = l_value.to(idtype, bitcast=True)
     ir_value = r_value.to(idtype, bitcast=True)
@@ -986,5 +988,100 @@ def sort_chunks_by_map(
         permuted_probs.stride(0) if permuted_probs is not None else None,
         PERMUTE_PROBS=probs is not None,
         FORWARD=is_forward,
+    )
+    return output, permuted_probs
+
+
+@triton.jit
+def _sort_chunks_by_map_blockwise_dequant_kernel(
+    # pointers
+    input_ptr,
+    scale_inv_ptr,
+    output_ptr,
+    row_id_map_ptr,
+    probs_ptr,
+    permuted_probs_ptr,
+    # sizes
+    hidden_size: tl.constexpr,
+    # strides
+    stride_input_token,
+    stride_input_hidden,
+    stride_scale_token,
+    stride_scale_block,
+    stride_output_token,
+    stride_output_hidden,
+    stride_probs_token,
+    stride_permuted_probs_token,
+    # metas
+    PERMUTE_PROBS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    src_row = pid_t
+    dst_row = tl.load(row_id_map_ptr + pid_t)
+
+    hidden_offsets = pid_h * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = hidden_offsets < hidden_size
+
+    input_offsets = src_row * stride_input_token + hidden_offsets * stride_input_hidden
+    output_offsets = dst_row * stride_output_token + hidden_offsets * stride_output_hidden
+    scale_offset = src_row * stride_scale_token + pid_h * stride_scale_block
+
+    fp8_values = tl.load(input_ptr + input_offsets, mask=mask).to(tl.float32)
+    scale = tl.load(scale_inv_ptr + scale_offset).to(tl.float32)
+    output = fp8_values * scale
+    tl.store(output_ptr + output_offsets, output, mask=mask)
+
+    if PERMUTE_PROBS:
+        if pid_h == 0:
+            prob_off = src_row * stride_probs_token
+            prob = tl.load(probs_ptr + prob_off)
+            permuted_prob_off = dst_row * stride_permuted_probs_token
+            tl.store(permuted_probs_ptr + permuted_prob_off, prob)
+
+
+def sort_chunks_by_map_blockwise_dequant(
+    inp: torch.Tensor,
+    scale_inv: torch.Tensor,
+    row_id_map: torch.Tensor,
+    probs: torch.Tensor,
+    num_tokens: int,
+    hidden_size: int,
+    output_dtype: torch.dtype,
+):
+    """
+    Sort chunk rows while dequantizing compact 1D blockwise FP8 data.
+
+    This is specialized for Float8BlockwiseQTensor rowwise compact scale layout:
+    scale_inv has shape [num_tokens, ceil(hidden_size / 128)].
+    """
+    output = torch.empty((num_tokens, hidden_size), dtype=output_dtype, device="cuda")
+    if probs is not None:
+        permuted_probs = torch.empty((num_tokens,), dtype=probs.dtype, device="cuda")
+    else:
+        permuted_probs = None
+
+    block_size = 128
+    grid = (num_tokens, triton.cdiv(hidden_size, block_size))
+    _sort_chunks_by_map_blockwise_dequant_kernel[grid](
+        inp,
+        scale_inv,
+        output,
+        row_id_map,
+        probs,
+        permuted_probs,
+        hidden_size,
+        inp.stride(0),
+        inp.stride(1),
+        scale_inv.stride(0),
+        scale_inv.stride(1),
+        output.stride(0),
+        output.stride(1),
+        probs.stride(0) if probs is not None else None,
+        permuted_probs.stride(0) if permuted_probs is not None else None,
+        PERMUTE_PROBS=probs is not None,
+        BLOCK_SIZE=block_size,
     )
     return output, permuted_probs

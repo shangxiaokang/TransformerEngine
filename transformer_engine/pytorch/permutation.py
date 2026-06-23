@@ -9,7 +9,7 @@ import torch
 
 import transformer_engine_torch as tex
 import transformer_engine.pytorch.triton.permutation as triton_permutation
-from transformer_engine.pytorch.constants import TE_DType
+from transformer_engine.pytorch.constants import TE_DType, TE_DType_To_Torch
 from transformer_engine.pytorch.tensor.quantized_tensor import QuantizedTensor
 from transformer_engine.pytorch.tensor.float8_tensor import Float8Tensor
 from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
@@ -645,6 +645,7 @@ class _moe_chunk_sort(torch.autograd.Function):
         num_splits = split_sizes.size(0)
         assert num_splits == sorted_idxs.size(0)
 
+        blockwise_dequant = isinstance(inp, Float8BlockwiseQTensor)
         fp8 = isinstance(inp, Float8Tensor)
         if fp8:
             fp8_dtype = inp._fp8_dtype
@@ -652,20 +653,45 @@ class _moe_chunk_sort(torch.autograd.Function):
             fake_dtype = inp.dtype
             inp = inp._data
 
+        if blockwise_dequant:
+            if inp._rowwise_data is None or inp._rowwise_scale_inv is None:
+                raise ValueError("Blockwise FP8 chunk sort requires rowwise data and scales.")
+            if inp._is_2D_scaled:
+                raise NotImplementedError("Blockwise FP8 chunk sort only supports 1D scaling.")
+            if inp._data_format != tex.Float8BlockScaleTensorFormat.COMPACT:
+                raise NotImplementedError(
+                    "Blockwise FP8 dequantizing chunk sort requires COMPACT scale format."
+                )
+            fp8_dtype = inp._fp8_dtype
+            fake_dtype = inp.dtype
+            scale_inv = inp._rowwise_scale_inv
+            inp = inp._rowwise_data.view(TE_DType_To_Torch[fp8_dtype])
+
         row_id_map = triton_permutation.make_chunk_sort_map(
             split_sizes,
             sorted_idxs,
             num_tokens,
             num_splits,
         )
-        output, permuted_probs = triton_permutation.sort_chunks_by_map(
-            inp,
-            row_id_map,
-            probs,
-            num_tokens,
-            hidden_size,
-            is_forward=True,
-        )
+        if blockwise_dequant:
+            output, permuted_probs = triton_permutation.sort_chunks_by_map_blockwise_dequant(
+                inp,
+                scale_inv,
+                row_id_map,
+                probs,
+                num_tokens,
+                hidden_size,
+                fake_dtype,
+            )
+        else:
+            output, permuted_probs = triton_permutation.sort_chunks_by_map(
+                inp,
+                row_id_map,
+                probs,
+                num_tokens,
+                hidden_size,
+                is_forward=True,
+            )
         if fp8:
             output = Float8Tensor(
                 data=output,
