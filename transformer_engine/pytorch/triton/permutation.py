@@ -880,6 +880,179 @@ def make_chunk_sort_map(
 
 
 @triton.jit
+def _make_chunk_sort_offsets_kernel(
+    # pointers
+    split_sizes_ptr,
+    sorted_indices_ptr,
+    input_offsets_ptr,
+    output_offsets_ptr,
+    sorted_chunk_sizes_ptr,
+    sorted_pos_ptr,
+    # sizes
+    num_splits: tl.constexpr,
+    # metas
+    IDX_LOAD_WIDTH: tl.constexpr,
+):
+    offsets = tl.arange(0, IDX_LOAD_WIDTH)
+    mask = offsets < num_splits
+
+    split_sizes = tl.load(split_sizes_ptr + offsets, mask=mask, other=0).to(tl.int32)
+    input_ends = tl.cumsum(split_sizes)
+    input_offsets = input_ends - split_sizes
+    tl.store(input_offsets_ptr + offsets, input_offsets, mask=mask)
+
+    sorted_indices = tl.load(sorted_indices_ptr + offsets, mask=mask, other=0)
+    sorted_chunk_sizes = tl.load(split_sizes_ptr + sorted_indices, mask=mask, other=0).to(tl.int32)
+    output_ends = tl.cumsum(sorted_chunk_sizes)
+    output_offsets = output_ends - sorted_chunk_sizes
+    tl.store(output_offsets_ptr + offsets, output_offsets, mask=mask)
+    tl.store(sorted_chunk_sizes_ptr + offsets, sorted_chunk_sizes, mask=mask)
+    tl.store(sorted_pos_ptr + sorted_indices, offsets, mask=mask)
+
+
+def make_chunk_sort_offsets(
+    split_sizes: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    num_splits: int,
+):
+    """Make compact chunk metadata for sorting without a per-token row_id_map."""
+    input_offsets = torch.empty((num_splits,), dtype=torch.int32, device="cuda")
+    output_offsets = torch.empty((num_splits,), dtype=torch.int32, device="cuda")
+    sorted_chunk_sizes = torch.empty((num_splits,), dtype=torch.int32, device="cuda")
+    sorted_pos = torch.empty((num_splits,), dtype=torch.int32, device="cuda")
+    _make_chunk_sort_offsets_kernel[(1,)](
+        split_sizes,
+        sorted_indices,
+        input_offsets,
+        output_offsets,
+        sorted_chunk_sizes,
+        sorted_pos,
+        num_splits,
+        IDX_LOAD_WIDTH=triton.next_power_of_2(num_splits),
+    )
+    return input_offsets, output_offsets, sorted_chunk_sizes, sorted_pos
+
+
+@triton.jit
+def _sort_chunks_by_offsets_backward_kernel(
+    # pointers
+    input_ptr,
+    output_ptr,
+    split_sizes_ptr,
+    input_offsets_ptr,
+    output_offsets_ptr,
+    sorted_pos_ptr,
+    probs_ptr,
+    permuted_probs_ptr,
+    # sizes
+    num_tokens,
+    hidden_size: tl.constexpr,
+    num_splits: tl.constexpr,
+    # strides
+    stride_input_token,
+    stride_input_hidden,
+    stride_output_token,
+    stride_output_hidden,
+    stride_probs_token,
+    stride_permuted_probs_token,
+    # metas
+    PERMUTE_PROBS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    IDX_LOAD_WIDTH: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    row_offsets = pid_t * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row_offsets < num_tokens
+
+    chunk_offsets = tl.arange(0, IDX_LOAD_WIDTH)
+    chunk_mask = chunk_offsets < num_splits
+    input_offsets = tl.load(input_offsets_ptr + chunk_offsets, mask=chunk_mask, other=0)
+    input_chunk_sizes = tl.load(split_sizes_ptr + chunk_offsets, mask=chunk_mask, other=0).to(tl.int32)
+    input_ends = tl.where(chunk_mask, input_offsets + input_chunk_sizes, num_tokens + 1)
+    input_chunk_idxs = tl.sum(
+        tl.where(input_ends[None, :] <= row_offsets[:, None], 1, 0), axis=1
+    )
+
+    output_chunk_idxs = tl.load(sorted_pos_ptr + input_chunk_idxs, mask=row_mask, other=0)
+    input_bases = tl.load(input_offsets_ptr + input_chunk_idxs, mask=row_mask, other=0)
+    output_bases = tl.load(output_offsets_ptr + output_chunk_idxs, mask=row_mask, other=0)
+    in_chunk_offsets = row_offsets - input_bases
+    src_rows = output_bases + in_chunk_offsets
+    dst_rows = row_offsets
+
+    hidden_offsets = pid_h * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    hidden_mask = hidden_offsets < hidden_size
+    mask = row_mask[:, None] & hidden_mask[None, :]
+
+    input_offsets = (
+        src_rows[:, None] * stride_input_token + hidden_offsets[None, :] * stride_input_hidden
+    )
+    output_offsets = (
+        dst_rows[:, None] * stride_output_token + hidden_offsets[None, :] * stride_output_hidden
+    )
+    inp = tl.load(input_ptr + input_offsets, mask=mask)
+    tl.store(output_ptr + output_offsets, inp, mask=mask)
+
+    if PERMUTE_PROBS:
+        if pid_h == 0:
+            prob_offsets = src_rows * stride_probs_token
+            probs = tl.load(probs_ptr + prob_offsets, mask=row_mask, other=0.0)
+            permuted_prob_offsets = dst_rows * stride_permuted_probs_token
+            tl.store(permuted_probs_ptr + permuted_prob_offsets, probs, mask=row_mask)
+
+
+def sort_chunks_by_offsets_backward(
+    inp: torch.Tensor,
+    split_sizes: torch.Tensor,
+    input_offsets: torch.Tensor,
+    output_offsets: torch.Tensor,
+    sorted_pos: torch.Tensor,
+    probs: torch.Tensor,
+    num_tokens: int,
+    hidden_size: int,
+):
+    """Inverse chunk sort using compact chunk offsets."""
+    output = torch.empty((num_tokens, hidden_size), dtype=inp.dtype, device="cuda")
+    if probs is not None:
+        permuted_probs = torch.empty((num_tokens,), dtype=probs.dtype, device="cuda")
+    else:
+        permuted_probs = None
+
+    block_rows = 4
+    block_size = 128
+    num_splits = split_sizes.size(0)
+    grid = (triton.cdiv(num_tokens, block_rows), triton.cdiv(hidden_size, block_size))
+    _sort_chunks_by_offsets_backward_kernel[grid](
+        inp,
+        output,
+        split_sizes,
+        input_offsets,
+        output_offsets,
+        sorted_pos,
+        probs,
+        permuted_probs,
+        num_tokens,
+        hidden_size,
+        num_splits,
+        inp.stride(0),
+        inp.stride(1),
+        output.stride(0),
+        output.stride(1),
+        probs.stride(0) if probs is not None else None,
+        permuted_probs.stride(0) if permuted_probs is not None else None,
+        PERMUTE_PROBS=probs is not None,
+        BLOCK_ROWS=block_rows,
+        BLOCK_SIZE=block_size,
+        IDX_LOAD_WIDTH=triton.next_power_of_2(num_splits),
+        num_warps=4,
+    )
+    return output, permuted_probs
+
+
+@triton.jit
 def _sort_chunks_by_map_kernel(
     # pointers
     input_ptr,
@@ -993,17 +1166,21 @@ def sort_chunks_by_map(
 
 
 @triton.jit
-def _sort_chunks_by_map_blockwise_dequant_kernel(
+def _sort_chunks_by_offsets_blockwise_dequant_kernel(
     # pointers
     input_ptr,
     scale_inv_ptr,
     output_ptr,
-    row_id_map_ptr,
+    input_offsets_ptr,
+    output_offsets_ptr,
+    sorted_chunk_sizes_ptr,
+    sorted_indices_ptr,
     probs_ptr,
     permuted_probs_ptr,
     # sizes
     num_tokens,
     hidden_size: tl.constexpr,
+    num_splits: tl.constexpr,
     # strides
     stride_input_token,
     stride_input_hidden,
@@ -1017,25 +1194,42 @@ def _sort_chunks_by_map_blockwise_dequant_kernel(
     PERMUTE_PROBS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    IDX_LOAD_WIDTH: tl.constexpr,
 ):
     pid_t = tl.program_id(0)
     pid_h = tl.program_id(1)
 
-    row_offsets = pid_t * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    row_mask = row_offsets < num_tokens
-    dst_rows = tl.load(row_id_map_ptr + row_offsets, mask=row_mask, other=0)
+    dst_rows = pid_t * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = dst_rows < num_tokens
+
+    chunk_offsets = tl.arange(0, IDX_LOAD_WIDTH)
+    chunk_mask = chunk_offsets < num_splits
+    output_offsets = tl.load(output_offsets_ptr + chunk_offsets, mask=chunk_mask, other=0)
+    sorted_chunk_sizes = tl.load(
+        sorted_chunk_sizes_ptr + chunk_offsets, mask=chunk_mask, other=0
+    ).to(tl.int32)
+    output_ends = tl.where(chunk_mask, output_offsets + sorted_chunk_sizes, num_tokens + 1)
+    output_chunk_idxs = tl.sum(
+        tl.where(output_ends[None, :] <= dst_rows[:, None], 1, 0), axis=1
+    )
+
+    src_chunks = tl.load(sorted_indices_ptr + output_chunk_idxs, mask=row_mask, other=0)
+    input_bases = tl.load(input_offsets_ptr + src_chunks, mask=row_mask, other=0)
+    output_bases = tl.load(output_offsets_ptr + output_chunk_idxs, mask=row_mask, other=0)
+    in_chunk_offsets = dst_rows - output_bases
+    src_rows = input_bases + in_chunk_offsets
 
     hidden_offsets = pid_h * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     hidden_mask = hidden_offsets < hidden_size
     mask = row_mask[:, None] & hidden_mask[None, :]
 
     input_offsets = (
-        row_offsets[:, None] * stride_input_token + hidden_offsets[None, :] * stride_input_hidden
+        src_rows[:, None] * stride_input_token + hidden_offsets[None, :] * stride_input_hidden
     )
     output_offsets = (
         dst_rows[:, None] * stride_output_token + hidden_offsets[None, :] * stride_output_hidden
     )
-    scale_offsets = row_offsets * stride_scale_token + pid_h * stride_scale_block
+    scale_offsets = src_rows * stride_scale_token + pid_h * stride_scale_block
 
     fp8_values = tl.load(input_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
     scale = tl.load(scale_inv_ptr + scale_offsets, mask=row_mask, other=0.0).to(tl.float32)
@@ -1044,16 +1238,19 @@ def _sort_chunks_by_map_blockwise_dequant_kernel(
 
     if PERMUTE_PROBS:
         if pid_h == 0:
-            prob_offsets = row_offsets * stride_probs_token
+            prob_offsets = src_rows * stride_probs_token
             probs = tl.load(probs_ptr + prob_offsets, mask=row_mask, other=0.0)
             permuted_prob_offsets = dst_rows * stride_permuted_probs_token
             tl.store(permuted_probs_ptr + permuted_prob_offsets, probs, mask=row_mask)
 
 
-def sort_chunks_by_map_blockwise_dequant(
+def sort_chunks_by_offsets_blockwise_dequant(
     inp: torch.Tensor,
     scale_inv: torch.Tensor,
-    row_id_map: torch.Tensor,
+    input_offsets: torch.Tensor,
+    output_offsets: torch.Tensor,
+    sorted_chunk_sizes: torch.Tensor,
+    sorted_indices: torch.Tensor,
     probs: torch.Tensor,
     num_tokens: int,
     hidden_size: int,
@@ -1062,8 +1259,7 @@ def sort_chunks_by_map_blockwise_dequant(
     """
     Sort chunk rows while dequantizing compact 1D blockwise FP8 data.
 
-    This is specialized for Float8BlockwiseQTensor rowwise compact scale layout:
-    scale_inv has shape [num_tokens, ceil(hidden_size / 128)].
+    This avoids a per-token row_id_map by using compact chunk offsets.
     """
     output = torch.empty((num_tokens, hidden_size), dtype=output_dtype, device="cuda")
     if probs is not None:
@@ -1073,16 +1269,21 @@ def sort_chunks_by_map_blockwise_dequant(
 
     block_rows = 4
     block_size = 128
+    num_splits = sorted_indices.size(0)
     grid = (triton.cdiv(num_tokens, block_rows), triton.cdiv(hidden_size, block_size))
-    _sort_chunks_by_map_blockwise_dequant_kernel[grid](
+    _sort_chunks_by_offsets_blockwise_dequant_kernel[grid](
         inp,
         scale_inv,
         output,
-        row_id_map,
+        input_offsets,
+        output_offsets,
+        sorted_chunk_sizes,
+        sorted_indices,
         probs,
         permuted_probs,
         num_tokens,
         hidden_size,
+        num_splits,
         inp.stride(0),
         inp.stride(1),
         scale_inv.stride(0),
@@ -1094,6 +1295,7 @@ def sort_chunks_by_map_blockwise_dequant(
         PERMUTE_PROBS=probs is not None,
         BLOCK_ROWS=block_rows,
         BLOCK_SIZE=block_size,
+        IDX_LOAD_WIDTH=triton.next_power_of_2(num_splits),
         num_warps=4,
     )
     return output, permuted_probs

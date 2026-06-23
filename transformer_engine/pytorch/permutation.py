@@ -667,23 +667,38 @@ class _moe_chunk_sort(torch.autograd.Function):
             scale_inv = inp._rowwise_scale_inv
             inp = inp._rowwise_data.view(TE_DType_To_Torch[fp8_dtype])
 
-        row_id_map = triton_permutation.make_chunk_sort_map(
-            split_sizes,
-            sorted_idxs,
-            num_tokens,
-            num_splits,
-        )
         if blockwise_dequant:
-            output, permuted_probs = triton_permutation.sort_chunks_by_map_blockwise_dequant(
+            (
+                input_offsets,
+                output_offsets,
+                sorted_chunk_sizes,
+                sorted_pos,
+            ) = triton_permutation.make_chunk_sort_offsets(
+                split_sizes,
+                sorted_idxs,
+                num_splits,
+            )
+            output, permuted_probs = triton_permutation.sort_chunks_by_offsets_blockwise_dequant(
                 inp,
                 scale_inv,
-                row_id_map,
+                input_offsets,
+                output_offsets,
+                sorted_chunk_sizes,
+                sorted_idxs,
                 probs,
                 num_tokens,
                 hidden_size,
                 fake_dtype,
             )
+            ctx_tensors = (split_sizes, input_offsets, output_offsets, sorted_pos)
+            ctx.use_chunk_offsets = True
         else:
+            row_id_map = triton_permutation.make_chunk_sort_map(
+                split_sizes,
+                sorted_idxs,
+                num_tokens,
+                num_splits,
+            )
             output, permuted_probs = triton_permutation.sort_chunks_by_map(
                 inp,
                 row_id_map,
@@ -692,6 +707,8 @@ class _moe_chunk_sort(torch.autograd.Function):
                 hidden_size,
                 is_forward=True,
             )
+            ctx_tensors = (row_id_map,)
+            ctx.use_chunk_offsets = False
         if fp8:
             output = Float8Tensor(
                 data=output,
@@ -701,7 +718,7 @@ class _moe_chunk_sort(torch.autograd.Function):
                 dtype=fake_dtype,
             )
 
-        ctx.save_for_backward(row_id_map)
+        ctx.save_for_backward(*ctx_tensors)
         ctx.num_tokens = num_tokens
         ctx.hidden_size = hidden_size
         return output, permuted_probs
@@ -719,21 +736,34 @@ class _moe_chunk_sort(torch.autograd.Function):
         act_grad = None
         probs_grad = None
         if ctx.needs_input_grad[0]:
-            (row_id_map,) = ctx.saved_tensors
             fp8 = isinstance(permuted_act_grad, Float8Tensor)
             if fp8:
                 fp8_dtype = permuted_act_grad._fp8_dtype
                 fp8_scale_inv = permuted_act_grad._scale_inv
                 fake_dtype = permuted_act_grad.dtype
                 permuted_act_grad = permuted_act_grad._data
-            act_grad, probs_grad = triton_permutation.sort_chunks_by_map(
-                permuted_act_grad,
-                row_id_map,
-                permuted_probs_grad,
-                ctx.num_tokens,
-                ctx.hidden_size,
-                is_forward=False,
-            )
+            if ctx.use_chunk_offsets:
+                split_sizes, input_offsets, output_offsets, sorted_pos = ctx.saved_tensors
+                act_grad, probs_grad = triton_permutation.sort_chunks_by_offsets_backward(
+                    permuted_act_grad,
+                    split_sizes,
+                    input_offsets,
+                    output_offsets,
+                    sorted_pos,
+                    permuted_probs_grad,
+                    ctx.num_tokens,
+                    ctx.hidden_size,
+                )
+            else:
+                (row_id_map,) = ctx.saved_tensors
+                act_grad, probs_grad = triton_permutation.sort_chunks_by_map(
+                    permuted_act_grad,
+                    row_id_map,
+                    permuted_probs_grad,
+                    ctx.num_tokens,
+                    ctx.hidden_size,
+                    is_forward=False,
+                )
             if fp8:
                 act_grad = Float8Tensor(
                     data=act_grad,
