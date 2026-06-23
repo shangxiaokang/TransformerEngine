@@ -330,6 +330,112 @@ class _moe_permute_mask_map(torch.autograd.Function):
         return act_grad, None, None, probs_grad
 
 
+
+def _fp8_max_value(fp8_dtype) -> float:
+    if fp8_dtype == tex.DType.kFloat8E4M3:
+        return 448.0
+    if fp8_dtype == tex.DType.kFloat8E5M2:
+        return 57344.0
+    raise ValueError(f"Unsupported FP8 dtype for blockwise quantization: {fp8_dtype}")
+
+
+class _moe_permute_mask_map_blockwise_quant(torch.autograd.Function):
+    """Permute with mask router map and quantize output to compact rowwise blockwise FP8."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        inp: torch.Tensor,
+        routing_map: torch.Tensor,
+        num_out_tokens: int,
+        probs: torch.Tensor,
+        fp8_dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # pylint: disable=missing-function-docstring
+        if not inp.numel():
+            ctx.probs = probs
+            return inp, torch.tensor([], device=inp.device), torch.tensor([], device=inp.device)
+
+        assert inp.is_cuda, "TransformerEngine needs CUDA."
+        assert routing_map.is_cuda, "TransformerEngine needs CUDA."
+        assert probs is not None, "Blockwise quantized permute requires probs."
+        assert probs.is_cuda, "TransformerEngine needs CUDA."
+        assert not isinstance(inp, QuantizedTensor), "Input is expected to be a plain tensor."
+
+        assert inp.size(0) == routing_map.size(0), "Permute not possible"
+        num_tokens, hidden_size = inp.size()
+        num_experts = routing_map.size(1)
+        assert (
+            num_out_tokens is not None
+        ), "num_out_tokens must be provided to the fused permute function."
+
+        row_id_map = triton_permutation.make_row_id_map(routing_map, num_tokens, num_experts)
+        fp8_torch_dtype = TE_DType_To_Torch[fp8_dtype]
+        max_fp8 = _fp8_max_value(fp8_dtype)
+        rowwise_data, scale_inv, permuted_probs = (
+            triton_permutation.permute_with_mask_map_blockwise_quant(
+                inp,
+                row_id_map,
+                probs,
+                num_tokens,
+                num_experts,
+                num_out_tokens,
+                hidden_size,
+                fp8_torch_dtype,
+                max_fp8,
+            )
+        )
+        output = Float8BlockwiseQTensor(
+            shape=rowwise_data.shape,
+            dtype=inp.dtype,
+            rowwise_data=rowwise_data,
+            rowwise_scale_inv=scale_inv,
+            columnwise_data=None,
+            columnwise_scale_inv=None,
+            fp8_dtype=fp8_dtype,
+            quantizer=None,
+            is_2D_scaled=False,
+            data_format=tex.Float8BlockScaleTensorFormat.COMPACT,
+            requires_grad=inp.requires_grad,
+        )
+
+        ctx.save_for_backward(row_id_map)
+        ctx.num_experts = num_experts
+        ctx.num_tokens = num_tokens
+        ctx.hidden_size = hidden_size
+        return output, row_id_map, permuted_probs
+
+    @staticmethod
+    def backward(
+        ctx,
+        permuted_act_grad: torch.Tensor,
+        _,
+        permuted_probs_grad: torch.Tensor,
+    ) -> Tuple[torch.Tensor, ...]:
+        # pylint: disable=missing-function-docstring
+        if not permuted_act_grad.numel():
+            return permuted_act_grad, None, None, ctx.probs, None
+
+        act_grad = None
+        probs_grad = None
+        if ctx.needs_input_grad[0]:
+            (row_id_map,) = ctx.saved_tensors
+            if isinstance(permuted_act_grad, QuantizedTensor):
+                permuted_act_grad = permuted_act_grad.dequantize(dtype=permuted_act_grad.dtype)
+            act_grad, probs_grad = triton_permutation.unpermute_with_mask_map(
+                permuted_act_grad,
+                row_id_map,
+                None,
+                permuted_probs_grad,
+                ctx.num_tokens,
+                ctx.num_experts,
+                ctx.hidden_size,
+            )
+        if not ctx.needs_input_grad[3]:
+            probs_grad = None
+        return act_grad, None, None, probs_grad, None
+
+
 class _moe_unpermute_mask_map(torch.autograd.Function):
     """functional Unpermute with mask router map"""
 
@@ -571,6 +677,22 @@ def moe_permute_with_probs(
     """
     output, row_id_map, permuted_probs = _moe_permute_mask_map.apply(
         inp, routing_map, num_out_tokens, probs
+    )
+    return output, permuted_probs, row_id_map
+
+
+def moe_permute_with_probs_blockwise_quantize(
+    inp: torch.Tensor,
+    probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    fp8_dtype,
+    num_out_tokens: int = -1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Permute tokens/probs and quantize permuted tokens to compact rowwise blockwise FP8.
+    """
+    output, row_id_map, permuted_probs = _moe_permute_mask_map_blockwise_quant.apply(
+        inp, routing_map, num_out_tokens, probs, fp8_dtype
     )
     return output, permuted_probs, row_id_map
 

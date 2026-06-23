@@ -368,6 +368,138 @@ def _permute_kernel(
             tl.store(output_ptr + output_off, inp, mask=mask)
 
 
+@triton.jit
+def _permute_with_mask_map_blockwise_quant_kernel(
+    # pointers
+    input_ptr,
+    output_ptr,
+    scale_inv_ptr,
+    row_id_map_ptr,
+    probs_ptr,
+    permuted_probs_ptr,
+    # sizes
+    num_experts: tl.constexpr,
+    hidden_size: tl.constexpr,
+    max_fp8: tl.constexpr,
+    # strides
+    stride_row_id_map_token,
+    stride_row_id_map_expert,
+    stride_input_token,
+    stride_input_hidden,
+    stride_output_token,
+    stride_output_hidden,
+    stride_scale_token,
+    stride_scale_hidden,
+    stride_probs_token,
+    stride_probs_expert,
+    stride_permuted_probs_token,
+    # metas
+    PERMUTE_PROBS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    hidden_offsets = pid_h * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    hidden_mask = hidden_offsets < hidden_size
+    input_offsets = pid_t * stride_input_token + hidden_offsets * stride_input_hidden
+    inp = tl.load(input_ptr + input_offsets, mask=hidden_mask, other=0.0).to(tl.float32)
+
+    abs_inp = tl.abs(inp)
+    abs_inp = tl.where(hidden_mask, abs_inp, 0.0)
+    amax = tl.max(abs_inp, axis=0)
+    raw_scale = max_fp8 / amax
+    valid_scale = (amax > 0.0) & (amax == amax) & (raw_scale > 0.0)
+    scale = tl.exp2(tl.floor(tl.log2(raw_scale)))
+    scale = tl.where(valid_scale, scale, 1.0)
+    scale_inv = 1.0 / scale
+    quantized = inp * scale
+
+    n_routed = tl.load(
+        row_id_map_ptr
+        + pid_t * stride_row_id_map_token
+        + num_experts * 2 * stride_row_id_map_expert
+    )
+    for idx in tl.range(n_routed):
+        dst_row = tl.load(
+            row_id_map_ptr + pid_t * stride_row_id_map_token + idx * stride_row_id_map_expert
+        )
+        active = True
+        if PERMUTE_PROBS:
+            expert_idx = tl.load(
+                row_id_map_ptr
+                + pid_t * stride_row_id_map_token
+                + (num_experts + idx) * stride_row_id_map_expert
+            )
+            prob_off = pid_t * stride_probs_token + expert_idx * stride_probs_expert
+            prob = tl.load(probs_ptr + prob_off)
+            active = prob != 0.0
+            if pid_h == 0:
+                permuted_prob_off = dst_row * stride_permuted_probs_token
+                tl.store(permuted_probs_ptr + permuted_prob_off, prob)
+
+        output_offsets = dst_row * stride_output_token + hidden_offsets * stride_output_hidden
+        output = tl.where(active, quantized, 0.0)
+        tl.store(output_ptr + output_offsets, output, mask=hidden_mask)
+
+        scale_out = tl.where(active, scale_inv, 1.0)
+        scale_offset = dst_row * stride_scale_token + pid_h * stride_scale_hidden
+        tl.store(scale_inv_ptr + scale_offset, scale_out)
+
+
+def permute_with_mask_map_blockwise_quant(
+    inp: torch.Tensor,
+    row_id_map: torch.Tensor,
+    probs: torch.Tensor,
+    num_tokens: int,
+    num_experts: int,
+    num_out_tokens: int,
+    hidden_size: int,
+    fp8_dtype: torch.dtype,
+    max_fp8: float,
+):
+    """Permute tokens and probabilities while quantizing tokens to compact rowwise FP8."""
+    if isinstance(num_out_tokens, torch.Tensor):
+        num_out_tokens = int(num_out_tokens.item())
+    rowwise_data = torch.empty((num_out_tokens, hidden_size), dtype=torch.uint8, device="cuda")
+    scale_inv = torch.empty(
+        (num_out_tokens, triton.cdiv(hidden_size, 128)), dtype=torch.float32, device="cuda"
+    )
+    if probs is not None:
+        permuted_probs = torch.empty((num_out_tokens,), dtype=probs.dtype, device="cuda")
+    else:
+        permuted_probs = None
+
+    block_size = 128
+    grid = (num_tokens, triton.cdiv(hidden_size, block_size))
+    _permute_with_mask_map_blockwise_quant_kernel[grid](
+        inp,
+        rowwise_data.view(fp8_dtype),
+        scale_inv,
+        row_id_map,
+        probs,
+        permuted_probs,
+        num_experts,
+        hidden_size,
+        max_fp8,
+        row_id_map.stride(0),
+        row_id_map.stride(1),
+        inp.stride(0),
+        inp.stride(1),
+        rowwise_data.stride(0),
+        rowwise_data.stride(1),
+        scale_inv.stride(0),
+        scale_inv.stride(1),
+        probs.stride(0) if probs is not None else None,
+        probs.stride(1) if probs is not None else None,
+        permuted_probs.stride(0) if permuted_probs is not None else None,
+        PERMUTE_PROBS=probs is not None,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+    return rowwise_data, scale_inv, permuted_probs
+
+
 try:
     _permute_kernel = triton.autotune(
         configs=[
