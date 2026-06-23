@@ -459,9 +459,17 @@ void fused_multi_row_padding(at::Tensor input, at::Tensor output,
                              std::vector<size_t> input_row_list,
                              std::vector<size_t> padded_input_row_list);
 
+void fused_multi_row_padding_pair(at::Tensor input_a, at::Tensor input_b, at::Tensor output_a,
+                                  at::Tensor output_b, std::vector<size_t> input_row_list,
+                                  std::vector<size_t> padded_input_row_list);
+
 void fused_multi_row_unpadding(at::Tensor input, at::Tensor output,
                                std::vector<size_t> input_row_list,
                                std::vector<size_t> unpadded_input_row_list);
+
+void fused_multi_row_unpadding_pair(at::Tensor input_a, at::Tensor input_b, at::Tensor output_a,
+                                    at::Tensor output_b, std::vector<size_t> input_row_list,
+                                    std::vector<size_t> unpadded_input_row_list);
 /***************************************************************************************************
  * NVSHMEM APIs
  **************************************************************************************************/

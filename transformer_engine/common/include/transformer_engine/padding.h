@@ -44,6 +44,26 @@ extern "C" {
 void nvte_multi_padding(size_t num_tensors, const NVTETensor* input_list, NVTETensor* output_list,
                         const int* padded_num_rows_list, cudaStream_t stream);
 
+/*! \brief Padding paired tensors with the same row splits.
+ *
+ *  This is equivalent to calling nvte_multi_padding twice, once for each tensor
+ *  list, but supports different dtypes for the two lists and launches one CUDA
+ *  kernel. It is intended for MoE expert inputs where hidden states and router
+ *  probabilities share row splits but have different feature widths/dtypes.
+ *
+ *  \param[in]     num_tensors              Number of tensor pairs.
+ *  \param[in]     input_a_list             First list of 2D input tensors.
+ *  \param[in,out] output_a_list            First list of padded output tensors.
+ *  \param[in]     input_b_list             Second list of 2D input tensors.
+ *  \param[in,out] output_b_list            Second list of padded output tensors.
+ *  \param[in]     padded_num_rows_list     List of padded num rows for each pair.
+ *  \param[in]     stream                   CUDA stream used for the operation.
+ */
+void nvte_multi_padding_pair(size_t num_tensors, const NVTETensor* input_a_list,
+                             NVTETensor* output_a_list, const NVTETensor* input_b_list,
+                             NVTETensor* output_b_list, const int* padded_num_rows_list,
+                             cudaStream_t stream);
+
 /*! \brief Unpadding multiple tensors (reverse operation of padding).
  *
  *  NOTE: Unpadding mode only removes bottom rows.
@@ -70,6 +90,25 @@ void nvte_multi_padding(size_t num_tensors, const NVTETensor* input_list, NVTETe
  */
 void nvte_multi_unpadding(size_t num_tensors, const NVTETensor* input_list, NVTETensor* output_list,
                           const int* unpadded_num_rows_list, cudaStream_t stream);
+
+/*! \brief Unpadding paired tensors with the same row splits.
+ *
+ *  This is equivalent to calling nvte_multi_unpadding twice, once for each
+ *  tensor list, but supports different dtypes for the two lists and launches one
+ *  CUDA kernel.
+ *
+ *  \param[in]     num_tensors               Number of tensor pairs.
+ *  \param[in]     input_a_list              First list of padded input tensors.
+ *  \param[in,out] output_a_list             First list of unpadded output tensors.
+ *  \param[in]     input_b_list              Second list of padded input tensors.
+ *  \param[in,out] output_b_list             Second list of unpadded output tensors.
+ *  \param[in]     unpadded_num_rows_list    List of unpadded num rows for each pair.
+ *  \param[in]     stream                    CUDA stream used for the operation.
+ */
+void nvte_multi_unpadding_pair(size_t num_tensors, const NVTETensor* input_a_list,
+                               NVTETensor* output_a_list, const NVTETensor* input_b_list,
+                               NVTETensor* output_b_list, const int* unpadded_num_rows_list,
+                               cudaStream_t stream);
 
 #ifdef __cplusplus
 }  // extern "C"
