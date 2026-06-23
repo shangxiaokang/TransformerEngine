@@ -1002,6 +1002,7 @@ def _sort_chunks_by_map_blockwise_dequant_kernel(
     probs_ptr,
     permuted_probs_ptr,
     # sizes
+    num_tokens,
     hidden_size: tl.constexpr,
     # strides
     stride_input_token,
@@ -1014,32 +1015,39 @@ def _sort_chunks_by_map_blockwise_dequant_kernel(
     stride_permuted_probs_token,
     # metas
     PERMUTE_PROBS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_t = tl.program_id(0)
     pid_h = tl.program_id(1)
 
-    src_row = pid_t
-    dst_row = tl.load(row_id_map_ptr + pid_t)
+    row_offsets = pid_t * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row_offsets < num_tokens
+    dst_rows = tl.load(row_id_map_ptr + row_offsets, mask=row_mask, other=0)
 
     hidden_offsets = pid_h * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = hidden_offsets < hidden_size
+    hidden_mask = hidden_offsets < hidden_size
+    mask = row_mask[:, None] & hidden_mask[None, :]
 
-    input_offsets = src_row * stride_input_token + hidden_offsets * stride_input_hidden
-    output_offsets = dst_row * stride_output_token + hidden_offsets * stride_output_hidden
-    scale_offset = src_row * stride_scale_token + pid_h * stride_scale_block
+    input_offsets = (
+        row_offsets[:, None] * stride_input_token + hidden_offsets[None, :] * stride_input_hidden
+    )
+    output_offsets = (
+        dst_rows[:, None] * stride_output_token + hidden_offsets[None, :] * stride_output_hidden
+    )
+    scale_offsets = row_offsets * stride_scale_token + pid_h * stride_scale_block
 
-    fp8_values = tl.load(input_ptr + input_offsets, mask=mask).to(tl.float32)
-    scale = tl.load(scale_inv_ptr + scale_offset).to(tl.float32)
-    output = fp8_values * scale
+    fp8_values = tl.load(input_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.load(scale_inv_ptr + scale_offsets, mask=row_mask, other=0.0).to(tl.float32)
+    output = fp8_values * scale[:, None]
     tl.store(output_ptr + output_offsets, output, mask=mask)
 
     if PERMUTE_PROBS:
         if pid_h == 0:
-            prob_off = src_row * stride_probs_token
-            prob = tl.load(probs_ptr + prob_off)
-            permuted_prob_off = dst_row * stride_permuted_probs_token
-            tl.store(permuted_probs_ptr + permuted_prob_off, prob)
+            prob_offsets = row_offsets * stride_probs_token
+            probs = tl.load(probs_ptr + prob_offsets, mask=row_mask, other=0.0)
+            permuted_prob_offsets = dst_rows * stride_permuted_probs_token
+            tl.store(permuted_probs_ptr + permuted_prob_offsets, probs, mask=row_mask)
 
 
 def sort_chunks_by_map_blockwise_dequant(
@@ -1063,8 +1071,9 @@ def sort_chunks_by_map_blockwise_dequant(
     else:
         permuted_probs = None
 
+    block_rows = 4
     block_size = 128
-    grid = (num_tokens, triton.cdiv(hidden_size, block_size))
+    grid = (triton.cdiv(num_tokens, block_rows), triton.cdiv(hidden_size, block_size))
     _sort_chunks_by_map_blockwise_dequant_kernel[grid](
         inp,
         scale_inv,
@@ -1072,6 +1081,7 @@ def sort_chunks_by_map_blockwise_dequant(
         row_id_map,
         probs,
         permuted_probs,
+        num_tokens,
         hidden_size,
         inp.stride(0),
         inp.stride(1),
@@ -1082,6 +1092,8 @@ def sort_chunks_by_map_blockwise_dequant(
         probs.stride(0) if probs is not None else None,
         permuted_probs.stride(0) if permuted_probs is not None else None,
         PERMUTE_PROBS=probs is not None,
+        BLOCK_ROWS=block_rows,
         BLOCK_SIZE=block_size,
+        num_warps=4,
     )
     return output, permuted_probs
