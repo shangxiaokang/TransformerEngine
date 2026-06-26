@@ -218,7 +218,10 @@ class _GroupedLinear(torch.autograd.Function):
                     inputmats[0] = inp
                 else:
                     for inputmat in inputmats:
-                        if isinstance(inputmat, QuantizedTensorBase):
+                        if isinstance(inputmat, Float8BlockwiseQTensorBase):
+                            inputmat.update_usage(rowwise_usage=True, columnwise_usage=True)
+                            inputmat.update_usage(rowwise_usage=False, columnwise_usage=True)
+                        elif isinstance(inputmat, QuantizedTensorBase):
                             inputmat.update_usage(rowwise_usage=False, columnwise_usage=True)
             else:
                 inputmats = [None] * num_gemms
