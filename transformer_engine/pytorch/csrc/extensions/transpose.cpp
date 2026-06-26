@@ -77,5 +77,49 @@ at::Tensor swap_first_dims(at::Tensor tensor, std::optional<at::Tensor> out) {
   return std::move(*out);
 }
 
+
+py::object fp8_blockwise_transpose(py::object tensor, py::object quantizer) {
+  init_extension();
+
+  NVTE_CHECK(!tensor.is_none(), "Tensor has not been provided");
+  NVTE_CHECK(detail::IsFloat8BlockwiseQuantizers(quantizer.ptr()),
+             "Quantizer must be a Float8BlockwiseQuantizer");
+
+  torch::Tensor torch_tensor = py::cast<torch::Tensor>(tensor);
+  auto torch_dtype = torch_tensor.scalar_type();
+  auto te_dtype = DType::kBFloat16;
+  switch (torch_dtype) {
+    case c10::ScalarType::Float:
+      te_dtype = DType::kFloat32;
+      break;
+    case c10::ScalarType::Half:
+      te_dtype = DType::kFloat16;
+      break;
+    case c10::ScalarType::BFloat16:
+      te_dtype = DType::kBFloat16;
+      break;
+    default:
+      NVTE_ERROR("Unsupported dtype");
+  }
+
+  TensorWrapper te_tensor = makeTransformerEngineTensor(tensor, quantizer);
+  NVTE_CHECK(nvte_tensor_scaling_mode(te_tensor.data()) == NVTE_BLOCK_SCALING_1D,
+             "Only 1D block scaling is supported for fp8 blockwise transpose");
+
+  auto quantizer_cpp = convert_quantizer(quantizer);
+  auto my_quantizer = static_cast<Float8BlockQuantizer *>(quantizer_cpp.get());
+  TORCH_CHECK(my_quantizer->force_pow_2_scales,
+              "Only power-of-2 scaling is supported for fp8 blockwise transpose");
+
+  QuantizationConfigWrapper quant_config;
+  quant_config.set_force_pow_2_scales(my_quantizer->force_pow_2_scales);
+  quant_config.set_amax_epsilon(my_quantizer->amax_epsilon);
+
+  nvte_transpose_blockwise(te_tensor.data(), quant_config, te_dtype,
+                           at::cuda::getCurrentCUDAStream());
+
+  return tensor;
+}
+
 }  // namespace pytorch
 }  // namespace transformer_engine

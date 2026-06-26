@@ -338,6 +338,9 @@ void nvte_dsreglu_cast_transpose(const NVTETensor input, const NVTETensor act_in
  *  \param[out]    output              Output tensor of shape [N, M, ...].
  *  \param[in]     stream              CUDA stream used for the operation.
  */
+void nvte_transpose_blockwise(NVTETensor tensor, const NVTEQuantizationConfig quant_config,
+                              transformer_engine::DType intermediate_dtype, cudaStream_t stream);
+
 void nvte_swap_first_dims(const NVTETensor input, NVTETensor output, cudaStream_t stream);
 
 #ifdef __cplusplus

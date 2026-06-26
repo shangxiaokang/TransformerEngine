@@ -452,6 +452,52 @@ class Float8BlockwiseQTensor(Float8BlockwiseQTensorBase, QuantizedTensor):
             return self
         raise ValueError("Float8BlockwiseQTensor does not support different memory formats!")
 
+
+    def split(self, split_size_or_sections) -> list[Float8BlockwiseQTensor]:
+        """Split a 1D blockwise tensor along the flattened token dimension."""
+        if self._is_2D_scaled:
+            raise NotImplementedError("split is only implemented for 1D blockwise scaling")
+        if self._rowwise_data is None or self._rowwise_scale_inv is None:
+            raise ValueError("split requires rowwise data and rowwise scale inverse")
+
+        in_features = self._rowwise_data.shape[-1]
+        rowwise_data = self._rowwise_data.reshape(-1, in_features)
+        rowwise_mats = torch.split(rowwise_data, split_size_or_sections, dim=0)
+
+        if self._is_gemm_ready_format():
+            scale_tiles = self._rowwise_scale_inv.shape[0]
+            rowwise_scale_mats = torch.split(
+                self._rowwise_scale_inv.reshape(scale_tiles, -1), split_size_or_sections, dim=1
+            )
+        else:
+            scale_tiles = self._rowwise_scale_inv.shape[-1]
+            compact_scale_mats = torch.split(
+                self._rowwise_scale_inv.reshape(-1, scale_tiles), split_size_or_sections, dim=0
+            )
+            rowwise_scale_mats = [x.transpose(-2, -1).contiguous() for x in compact_scale_mats]
+
+        columnwise_mats = [None] * len(rowwise_mats)
+        columnwise_scale_mats = [None] * len(rowwise_mats)
+
+        return [
+            Float8BlockwiseQTensor(
+                shape=rowwise_mat.shape,
+                rowwise_data=rowwise_mat,
+                rowwise_scale_inv=rowwise_scale_mat,
+                columnwise_data=columnwise_mat,
+                columnwise_scale_inv=columnwise_scale_mat,
+                fp8_dtype=self._fp8_dtype,
+                dtype=self.dtype,
+                quantizer=self._get_quantizer(),
+                is_2D_scaled=False,
+                data_format=Float8BlockScaleTensorFormat.GEMM_READY,
+                requires_grad=self.requires_grad,
+            )
+            for rowwise_mat, rowwise_scale_mat, columnwise_mat, columnwise_scale_mat in zip(
+                rowwise_mats, rowwise_scale_mats, columnwise_mats, columnwise_scale_mats
+            )
+        ]
+
     @classmethod
     def _make_in_reduce_ex(
         cls,

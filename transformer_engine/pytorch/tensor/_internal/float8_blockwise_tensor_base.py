@@ -315,36 +315,55 @@ class Float8BlockwiseQTensorBase(QuantizedTensorBase):
         return torch.Size(reordered)
 
     def _create_columnwise(self):
-        """
-        Update columnwise data and columnwise scale inv. Can only be used when using 2D scaling.
-        """
-        assert self._is_2D_scaled, "Cannot create columnwise data when not using 2D scaling."
+        """Create columnwise data and scale inverse from rowwise data."""
+        assert self._rowwise_data is not None and self._rowwise_scale_inv is not None, (
+            "Cannot create columnwise data when rowwise data is None."
+        )
+        assert self._quantizer is not None, (
+            "._quantizer of Float8BlockwiseQTensor cannot be None because all the blockwise "
+            "quantized tensors are supposed to be generated from the quantizer."
+        )
 
         rowwise_data = self._rowwise_data
         if not rowwise_data.is_contiguous():
             rowwise_data = rowwise_data.contiguous()
-        self._columnwise_data = tex.fp8_transpose(
-            rowwise_data, self._fp8_dtype, out=self._columnwise_data
-        )
+            self._rowwise_data = rowwise_data
 
-        if self._columnwise_scale_inv is None:
-            assert self._quantizer is not None, (
-                "._quantizer of Float8BlockwiseQTensor cannot be None because all the blockwise "
-                "quantized tensors are supposed to be generated from the quantizer."
+        if self._is_2D_scaled:
+            self._columnwise_data = tex.fp8_transpose(
+                rowwise_data, self._fp8_dtype, out=self._columnwise_data
             )
-            columnwise_scale_inv_shape = self._quantizer.get_scale_shape(rowwise_data.shape, True)
-            self._columnwise_scale_inv = torch.empty(
-                columnwise_scale_inv_shape,
-                dtype=self._rowwise_scale_inv.dtype,
-                device=self._rowwise_scale_inv.device,
-            )
-        assert len(self._rowwise_scale_inv.shape) == 2
-        assert len(self._columnwise_scale_inv.shape) == 2
-        rowwise_scale_inv = self._rowwise_scale_inv
-        columnwise_scale_inv = rowwise_scale_inv.transpose(-2, -1)
-        h = min(self._columnwise_scale_inv.shape[0], columnwise_scale_inv.shape[0])
-        w = min(self._columnwise_scale_inv.shape[1], columnwise_scale_inv.shape[1])
-        self._columnwise_scale_inv[0:h, 0:w].copy_(columnwise_scale_inv[0:h, 0:w])
+            if self._columnwise_scale_inv is None:
+                self._columnwise_scale_inv = torch.empty(
+                    self._quantizer.get_scale_shape(rowwise_data.shape, True),
+                    dtype=self._rowwise_scale_inv.dtype,
+                    device=self._rowwise_scale_inv.device,
+                )
+            columnwise_scale_inv = self._rowwise_scale_inv.transpose(-2, -1)
+            h = min(self._columnwise_scale_inv.shape[0], columnwise_scale_inv.shape[0])
+            w = min(self._columnwise_scale_inv.shape[1], columnwise_scale_inv.shape[1])
+            self._columnwise_scale_inv[0:h, 0:w].copy_(columnwise_scale_inv[0:h, 0:w])
+            return
+
+        if not self._is_gemm_ready_format():
+            self._rowwise_scale_inv = self._rowwise_scale_inv.transpose(-2, -1).contiguous()
+            self._data_format = Float8BlockScaleTensorFormat.GEMM_READY
+
+        rowwise_shape = self._rowwise_data.reshape(-1, self._rowwise_data.shape[-1]).shape
+        columnwise_shape = (rowwise_shape[-1], rowwise_shape[0])
+        self._columnwise_data = torch.empty(
+            columnwise_shape, dtype=self._rowwise_data.dtype, device=self._rowwise_data.device
+        )
+        columnwise_scale_inv_shape = (
+            math.ceil(rowwise_shape[0] / self._quantizer.block_len),
+            rowwise_shape[1],
+        )
+        self._columnwise_scale_inv = torch.empty(
+            columnwise_scale_inv_shape,
+            dtype=self._rowwise_scale_inv.dtype,
+            device=self._rowwise_scale_inv.device,
+        )
+        tex.fp8_blockwise_transpose(self, self._quantizer)
 
     def _transpose_columnwise_data(self):
         """Plainly transpose the columnwise data and scale inv."""
@@ -387,23 +406,11 @@ class Float8BlockwiseQTensorBase(QuantizedTensorBase):
         ), "Must retain some data either columnwise or rowwise"
 
         if columnwise_usage and rowwise_usage:
-            if not self._is_2D_scaled:
-                # For 1D scaling, we cannot create columnwise data/scale_inv from rowwise
-                # data/scale_inv because their scale values are different.
-                assert (
-                    self._rowwise_data is not None
-                    and self._rowwise_scale_inv is not None
-                    and self._columnwise_data is not None
-                    and self._columnwise_scale_inv is not None
-                ), "Cannot update to rowwise and columnwise usage."
-            else:
-                # For 2D scaling, if columnwise data/scale_inv is None, we can create them from
-                # rowwise data/scale_inv.
-                assert (
-                    self._rowwise_data is not None and self._rowwise_scale_inv is not None
-                ), "Cannot update to rowwise and columnwise usage because rowwise data is None."
-                if self._columnwise_data is None or self._columnwise_scale_inv is None:
-                    self._create_columnwise()
+            assert (
+                self._rowwise_data is not None and self._rowwise_scale_inv is not None
+            ), "Cannot update to rowwise and columnwise usage because rowwise data is None."
+            if self._columnwise_data is None or self._columnwise_scale_inv is None:
+                self._create_columnwise()
             return
 
         if rowwise_usage:

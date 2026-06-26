@@ -94,6 +94,7 @@ list(APPEND transformer_engine_SOURCES
      transpose/multi_cast_transpose.cu
      transpose/quantize_transpose_square_blockwise.cu
      transpose/quantize_transpose_vector_blockwise.cu
+     transpose/dequantize_cast_transpose_blockwise.cu
      transpose/swap_first_dims.cu
      transpose/quantize_transpose_vector_blockwise_fp4.cu
      activation/gelu.cu
