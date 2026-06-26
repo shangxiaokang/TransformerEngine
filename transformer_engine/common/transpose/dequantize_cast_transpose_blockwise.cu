@@ -246,7 +246,7 @@ __global__ void dequantize_cast_transpose_1x128_kernel(FP8_TYPE *input, float *i
 void nvte_transpose_blockwise(NVTETensor tensor, const NVTEQuantizationConfig quant_config, transformer_engine::DType intermediate_dtype, cudaStream_t stream) {
   NVTE_API_CALL(nvte_transpose_blockwise);
   using namespace transformer_engine;
-  auto te_tensor = *reinterpret_cast<const Tensor *>(tensor);
+  const auto &te_tensor = *convertNVTETensorCheck(tensor);
 
   // Get the data and the scale
   auto rowwise_data = te_tensor.data;
