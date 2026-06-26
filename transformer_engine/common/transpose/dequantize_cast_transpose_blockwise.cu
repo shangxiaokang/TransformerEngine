@@ -261,6 +261,10 @@ void nvte_transpose_blockwise(NVTETensor tensor, const NVTEQuantizationConfig qu
   auto colwise_scale_inv_shape = colwise_scale_inv.shape;
   auto itype = rowwise_data.dtype;
 
+  NVTE_CHECK(rowwise_data.dptr != nullptr, "rowwise_data must be allocated");
+  NVTE_CHECK(rowwise_scale_inv.dptr != nullptr, "rowwise_scale_inv must be allocated");
+  NVTE_CHECK(colwise_data.dptr != nullptr, "columnwise_data must be allocated");
+  NVTE_CHECK(colwise_scale_inv.dptr != nullptr, "columnwise_scale_inv must be allocated");
   NVTE_CHECK(rowwise_shape.size() == 2, "rowwise_shape must be 2D");
   NVTE_CHECK(rowwise_scale_inv_shape.size() == 2, "rowwise_scale_inv_shape must be 2D");
   NVTE_CHECK(colwise_shape.size() == 2, "colwise_shape must be 2D");
@@ -276,10 +280,14 @@ void nvte_transpose_blockwise(NVTETensor tensor, const NVTEQuantizationConfig qu
              "colwise_shape[0]:",
              colwise_shape[0], ", colwise_scale_inv_shape[1]:", colwise_scale_inv_shape[1]);
 
-  const QuantizationConfig *quant_config_cpp =
-      reinterpret_cast<const QuantizationConfig *>(quant_config);
-  const bool force_pow_2_scales = quant_config_cpp ? quant_config_cpp->force_pow_2_scales : false;
-  const float epsilon = quant_config_cpp ? quant_config_cpp->amax_epsilon : 0.0f;
+  bool force_pow_2_scales = false;
+  float epsilon = 0.0f;
+  size_t size_written = 0;
+  nvte_get_quantization_config_attribute(quant_config, kNVTEQuantizationConfigForcePow2Scales,
+                                         &force_pow_2_scales, sizeof(force_pow_2_scales),
+                                         &size_written);
+  nvte_get_quantization_config_attribute(quant_config, kNVTEQuantizationConfigAmaxEpsilon,
+                                         &epsilon, sizeof(epsilon), &size_written);
   NVTE_CHECK(force_pow_2_scales,
              "Only power-of-2 scaling is supported for fp8 blockwise transpose");
 
