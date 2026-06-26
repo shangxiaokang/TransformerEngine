@@ -768,8 +768,6 @@ class GroupedLinear(TransformerEngineBaseModule):
         if isinstance(inp, QuantizedTensorBase) and not fp8_input:
             raise ValueError("GroupedLinear only supports Float8BlockwiseQTensor as FP8 input.")
         if fp8_input:
-            if not self.fp8:
-                raise ValueError("FP8 blockwise input requires FP8 GroupedLinear execution.")
             if inp._is_2D_scaled:
                 raise ValueError("GroupedLinear FP8 input path only supports 1D blockwise scaling.")
             if self.sequence_parallel:
