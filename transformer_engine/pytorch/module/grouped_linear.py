@@ -159,6 +159,25 @@ def _split_prequantized_blockwise_input(
     return inputmats
 
 
+def _quantize_prequantized_blockwise_input_for_wgrad(
+    inp: Float8BlockwiseQTensorBase,
+    m_splits: List[int],
+    input_quantizers: List[Quantizer],
+    activation_dtype: torch.dtype,
+) -> List[QuantizedTensorBase]:
+    """Quantize direct-FP8 input into columnwise per-GEMM tensors for wgrad."""
+    if input_quantizers[0] is None:
+        raise RuntimeError(
+            "GroupedLinear pre-quantized FP8 input requires input quantizers for wgrad."
+        )
+    for input_quantizer in input_quantizers:
+        input_quantizer.set_usage(rowwise=False, columnwise=True)
+
+    in_features = inp.size(-1)
+    inp_view = inp.dequantize(dtype=activation_dtype).reshape(-1, in_features)
+    return tex.split_quantize(inp_view, m_splits, input_quantizers)
+
+
 class _GroupedLinear(torch.autograd.Function):
     """GroupedLinear semi-top level module
     Calls custom cuda extensions.
@@ -317,13 +336,16 @@ class _GroupedLinear(torch.autograd.Function):
 
             # TODO: update after #1638 is merged. # pylint: disable=fixme
             if weight_requires_grad:
-                if save_input_for_wgrad:
+                if prequantized_blockwise_input:
+                    inputmats = _quantize_prequantized_blockwise_input_for_wgrad(
+                        inp,
+                        m_splits,
+                        input_quantizers,
+                        activation_dtype,
+                    )
+                elif save_original_input:
                     inputmats = [None] * num_gemms
-                    if prequantized_blockwise_input:
-                        # Rowwise 1D blockwise input cannot provide columnwise wgrad data directly.
-                        inputmats[0] = inp.dequantize(dtype=activation_dtype)
-                    else:
-                        inputmats[0] = inp
+                    inputmats[0] = inp
                 else:
                     for inputmat in inputmats:
                         if isinstance(inputmat, QuantizedTensorBase):
@@ -379,7 +401,7 @@ class _GroupedLinear(torch.autograd.Function):
                     or FP8GlobalStateManager.is_first_fp8_module()
                 )
             ctx.wgrad_store = wgrad_store
-            ctx.save_original_input = save_input_for_wgrad
+            ctx.save_original_input = save_original_input and not prequantized_blockwise_input
             ctx.input_quantizers = input_quantizers
 
         # [*, in_features] -> [*, out_features] except first dimension changes for SP
