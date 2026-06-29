@@ -195,6 +195,8 @@ class _GroupedLinear(torch.autograd.Function):
         biases = weights_and_biases[num_gemms:]
         device = inp.device
         weight_requires_grad = weights[0].requires_grad
+        prequantized_blockwise_input = _is_prequantized_blockwise_input(inp)
+        save_input_for_wgrad = save_original_input or prequantized_blockwise_input
 
         # Configure quantizers
         if save_original_input and isinstance(input_quantizers[0], Float8Quantizer):
@@ -204,7 +206,7 @@ class _GroupedLinear(torch.autograd.Function):
                 input_quantizer.set_usage(
                     rowwise=True,
                     columnwise=(
-                        is_grad_enabled and weight_requires_grad and not save_original_input
+                        is_grad_enabled and weight_requires_grad and not save_input_for_wgrad
                     ),
                 )
             columnwise_usage = is_grad_enabled and inp.requires_grad
@@ -222,13 +224,6 @@ class _GroupedLinear(torch.autograd.Function):
 
         # Initialize input tensors
         in_features = weights[0].size(-1)
-        prequantized_blockwise_input = _is_prequantized_blockwise_input(inp)
-        if prequantized_blockwise_input and is_grad_enabled:
-            raise NotImplementedError(
-                "GroupedLinear forward supports pre-quantized rowwise blockwise FP8 input only "
-                "when grad is disabled. Training backward saved-input/wgrad semantics are not "
-                "implemented yet."
-            )
         if prequantized_blockwise_input:
             if not fp8:
                 raise RuntimeError("GroupedLinear pre-quantized FP8 input requires FP8 enabled.")
@@ -322,9 +317,13 @@ class _GroupedLinear(torch.autograd.Function):
 
             # TODO: update after #1638 is merged. # pylint: disable=fixme
             if weight_requires_grad:
-                if save_original_input:
+                if save_input_for_wgrad:
                     inputmats = [None] * num_gemms
-                    inputmats[0] = inp
+                    if prequantized_blockwise_input:
+                        # Rowwise 1D blockwise input cannot provide columnwise wgrad data directly.
+                        inputmats[0] = inp.dequantize(dtype=activation_dtype)
+                    else:
+                        inputmats[0] = inp
                 else:
                     for inputmat in inputmats:
                         if isinstance(inputmat, QuantizedTensorBase):
@@ -380,7 +379,7 @@ class _GroupedLinear(torch.autograd.Function):
                     or FP8GlobalStateManager.is_first_fp8_module()
                 )
             ctx.wgrad_store = wgrad_store
-            ctx.save_original_input = save_original_input
+            ctx.save_original_input = save_input_for_wgrad
             ctx.input_quantizers = input_quantizers
 
         # [*, in_features] -> [*, out_features] except first dimension changes for SP
@@ -864,12 +863,7 @@ class GroupedLinear(TransformerEngineBaseModule):
         assert not isinstance(inp, QuantizedTensorBase) or prequantized_blockwise_input, (
             "GroupedLinear only supports pre-quantized input tensors for rowwise blockwise FP8."
         )
-        if prequantized_blockwise_input and torch.is_grad_enabled():
-            raise NotImplementedError(
-                "GroupedLinear forward supports pre-quantized rowwise blockwise FP8 input only "
-                "when grad is disabled. Training backward saved-input/wgrad semantics are not "
-                "implemented yet."
-            )
+
         assert len(m_splits) == self.num_gemms, "Number of splits should match number of GEMMs."
 
         if FP8GlobalStateManager.fp8_graph_capturing():
