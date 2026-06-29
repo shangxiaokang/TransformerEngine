@@ -26,6 +26,7 @@ from ..utils import (
     cast_if_needed,
     clear_tensor_data,
     init_method_constant,
+    round_up_to_nearest_multiple,
     requires_grad,
 )
 from ..distributed import (
@@ -43,6 +44,8 @@ from ..graph import is_graph_capturing
 from ..cpu_offload import is_cpu_offload_enabled
 
 from ..tensor.float8_tensor import Float8CurrentScalingQuantizer, Float8Quantizer
+from ..tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
+from ..tensor._internal.float8_blockwise_tensor_base import Float8BlockwiseQTensorBase
 from ..tensor.quantized_tensor import (
     QuantizedTensorBase,
     Quantizer,
@@ -51,6 +54,109 @@ from ..tensor.quantized_tensor import (
 )
 
 __all__ = ["GroupedLinear"]
+
+
+def _is_prequantized_blockwise_input(inp: torch.Tensor) -> bool:
+    """Return whether input is a pre-quantized blockwise FP8 QTensor."""
+    return isinstance(inp, Float8BlockwiseQTensorBase)
+
+
+def _validate_prequantized_blockwise_input(
+    inp: Float8BlockwiseQTensorBase,
+    m_splits: List[int],
+    in_features: int,
+) -> None:
+    """Validate rowwise 1D blockwise FP8 input for GroupedLinear fprop GEMM."""
+    if inp._rowwise_data is None or inp._rowwise_scale_inv is None:
+        raise RuntimeError("GroupedLinear pre-quantized FP8 input requires rowwise data/scales.")
+    if inp._is_2D_scaled:
+        raise RuntimeError(
+            "GroupedLinear pre-quantized FP8 input only supports rowwise 1D block scaling."
+        )
+    if len(inp.shape) != 2:
+        raise RuntimeError(
+            "GroupedLinear pre-quantized FP8 input expects a 2D [tokens, hidden] tensor, "
+            f"got shape={tuple(inp.shape)}."
+        )
+    if inp.size(-1) != in_features:
+        raise ValueError(
+            f"Input tensor (shape={tuple(inp.size())}) is not compatible with "
+            f"weight in_features={in_features}"
+        )
+    if sum(int(split) for split in m_splits) != inp.size(0):
+        raise ValueError(
+            "GroupedLinear m_splits must sum to the pre-quantized FP8 input token count "
+            f"({sum(int(split) for split in m_splits)} != {inp.size(0)})."
+        )
+    if inp._rowwise_data.shape != inp.shape:
+        raise RuntimeError(
+            "GroupedLinear pre-quantized FP8 rowwise data must match the logical input shape."
+        )
+    if inp._rowwise_scale_inv.dim() != 2:
+        raise RuntimeError("GroupedLinear pre-quantized FP8 rowwise scales must be 2D.")
+
+    hidden_blocks = (in_features + 127) // 128
+    if inp._data_format == tex.Float8BlockScaleTensorFormat.COMPACT:
+        if inp._rowwise_scale_inv.size(0) != inp.size(0):
+            raise RuntimeError(
+                "GroupedLinear COMPACT FP8 scales must have one row per input token."
+            )
+        if inp._rowwise_scale_inv.size(1) < hidden_blocks:
+            raise RuntimeError("GroupedLinear COMPACT FP8 scales do not cover hidden blocks.")
+    elif inp._data_format == tex.Float8BlockScaleTensorFormat.GEMM_READY:
+        if inp._rowwise_scale_inv.size(0) < hidden_blocks:
+            raise RuntimeError("GroupedLinear GEMM_READY FP8 scales do not cover hidden blocks.")
+        if inp._rowwise_scale_inv.size(1) < inp.size(0):
+            raise RuntimeError("GroupedLinear GEMM_READY FP8 scales do not cover input tokens.")
+    else:
+        raise RuntimeError(
+            "GroupedLinear pre-quantized FP8 input expects COMPACT or GEMM_READY scale format."
+        )
+
+
+def _split_prequantized_blockwise_input(
+    inp: Float8BlockwiseQTensorBase,
+    m_splits: List[int],
+) -> List[Float8BlockwiseQTensor]:
+    """Split rowwise blockwise FP8 input into per-GEMM GEMM_READY tensors."""
+    inputmats = []
+    offset = 0
+    for split in m_splits:
+        split = int(split)
+        rowwise_data = inp._rowwise_data.narrow(0, offset, split).contiguous()
+
+        if inp._data_format == tex.Float8BlockScaleTensorFormat.COMPACT:
+            rowwise_scale_inv = inp._rowwise_scale_inv.narrow(0, offset, split).transpose(0, 1)
+        else:
+            rowwise_scale_inv = inp._rowwise_scale_inv.narrow(1, offset, split)
+        rowwise_scale_inv = rowwise_scale_inv.contiguous()
+
+        padded_m = round_up_to_nearest_multiple(split, 4)
+        if rowwise_scale_inv.size(1) < padded_m:
+            rowwise_scale_inv = torch.nn.functional.pad(
+                rowwise_scale_inv,
+                (0, padded_m - rowwise_scale_inv.size(1)),
+                mode="constant",
+                value=0,
+            )
+
+        inputmats.append(
+            Float8BlockwiseQTensor(
+                shape=rowwise_data.shape,
+                dtype=inp.dtype,
+                rowwise_data=rowwise_data,
+                rowwise_scale_inv=rowwise_scale_inv,
+                columnwise_data=None,
+                columnwise_scale_inv=None,
+                fp8_dtype=inp._fp8_dtype,
+                quantizer=inp._quantizer,
+                is_2D_scaled=False,
+                data_format=tex.Float8BlockScaleTensorFormat.GEMM_READY,
+                requires_grad=inp.requires_grad,
+            )
+        )
+        offset += split
+    return inputmats
 
 
 class _GroupedLinear(torch.autograd.Function):
@@ -116,17 +222,30 @@ class _GroupedLinear(torch.autograd.Function):
 
         # Initialize input tensors
         in_features = weights[0].size(-1)
-        if inp.size(-1) != in_features:
-            raise ValueError(
-                f"Input tensor (shape={tuple(inp.size())}) is not compatible with "
-                f"weight tensor (shape={tuple(weights[0].size())})"
+        prequantized_blockwise_input = _is_prequantized_blockwise_input(inp)
+        if prequantized_blockwise_input and is_grad_enabled:
+            raise NotImplementedError(
+                "GroupedLinear forward supports pre-quantized rowwise blockwise FP8 input only "
+                "when grad is disabled. Training backward saved-input/wgrad semantics are not "
+                "implemented yet."
             )
-        inp_view = inp.reshape(-1, in_features)
-        inputmats: list
-        if fp8:
-            inputmats = tex.split_quantize(inp_view, m_splits, input_quantizers)
+        if prequantized_blockwise_input:
+            if not fp8:
+                raise RuntimeError("GroupedLinear pre-quantized FP8 input requires FP8 enabled.")
+            _validate_prequantized_blockwise_input(inp, m_splits, in_features)
+            inp_view = None
+            inputmats = _split_prequantized_blockwise_input(inp, m_splits)
         else:
-            inputmats = torch.split(cast_if_needed(inp_view, activation_dtype), m_splits)
+            if inp.size(-1) != in_features:
+                raise ValueError(
+                    f"Input tensor (shape={tuple(inp.size())}) is not compatible with "
+                    f"weight tensor (shape={tuple(weights[0].size())})"
+                )
+            inp_view = inp.reshape(-1, in_features)
+            if fp8:
+                inputmats = tex.split_quantize(inp_view, m_splits, input_quantizers)
+            else:
+                inputmats = torch.split(cast_if_needed(inp_view, activation_dtype), m_splits)
 
         # Initialize weights
         weights_fp8: list
@@ -146,6 +265,14 @@ class _GroupedLinear(torch.autograd.Function):
 
         else:
             weights_fp8 = [cast_if_needed(weight, activation_dtype) for weight in weights]
+
+        if prequantized_blockwise_input and not all(
+            isinstance(weight, Float8BlockwiseQTensorBase) for weight in weights_fp8
+        ):
+            raise RuntimeError(
+                "GroupedLinear pre-quantized blockwise FP8 input requires blockwise FP8 "
+                "weight tensors. Use a blockwise FP8 recipe for this path."
+            )
 
         # Initialize biases
         bias_dtype = activation_dtype
@@ -733,9 +860,16 @@ class GroupedLinear(TransformerEngineBaseModule):
                                first microbatch (since it is the first gradient being
                                produced)
         """
-        assert not isinstance(
-            inp, QuantizedTensorBase
-        ), "GroupedLinear doesn't support input tensor in FP8."
+        prequantized_blockwise_input = _is_prequantized_blockwise_input(inp)
+        assert not isinstance(inp, QuantizedTensorBase) or prequantized_blockwise_input, (
+            "GroupedLinear only supports pre-quantized input tensors for rowwise blockwise FP8."
+        )
+        if prequantized_blockwise_input and torch.is_grad_enabled():
+            raise NotImplementedError(
+                "GroupedLinear forward supports pre-quantized rowwise blockwise FP8 input only "
+                "when grad is disabled. Training backward saved-input/wgrad semantics are not "
+                "implemented yet."
+            )
         assert len(m_splits) == self.num_gemms, "Number of splits should match number of GEMMs."
 
         if FP8GlobalStateManager.fp8_graph_capturing():
