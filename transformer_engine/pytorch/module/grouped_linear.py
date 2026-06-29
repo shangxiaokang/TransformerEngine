@@ -178,6 +178,26 @@ def _quantize_prequantized_blockwise_input_for_wgrad(
     return tex.split_quantize(inp_view, m_splits, input_quantizers)
 
 
+def _quantize_prequantized_blockwise_grad_output_for_wgrad(
+    grad_output: Float8BlockwiseQTensorBase,
+    m_splits: List[int],
+    grad_output_quantizers: List[Quantizer],
+    activation_dtype: torch.dtype,
+) -> List[QuantizedTensorBase]:
+    """Quantize direct-FP8 grad output into columnwise per-GEMM tensors for wgrad."""
+    if grad_output_quantizers[0] is None:
+        raise RuntimeError(
+            "GroupedLinear pre-quantized FP8 grad output requires grad output quantizers for "
+            "wgrad."
+        )
+    for grad_output_quantizer in grad_output_quantizers:
+        grad_output_quantizer.set_usage(rowwise=False, columnwise=True)
+
+    out_features = grad_output.size(-1)
+    grad_output_view = grad_output.dequantize(dtype=activation_dtype).reshape(-1, out_features)
+    return tex.split_quantize(grad_output_view, m_splits, grad_output_quantizers)
+
+
 class _GroupedLinear(torch.autograd.Function):
     """GroupedLinear semi-top level module
     Calls custom cuda extensions.
@@ -426,43 +446,84 @@ class _GroupedLinear(torch.autograd.Function):
                     weights[i] = w
 
             # Preprocess grad output
-            grad_output_view = grad_output.contiguous().view(-1, grad_output.shape[-1])
-            grad_output = [None] * ctx.num_gemms
+            prequantized_blockwise_grad_output = _is_prequantized_blockwise_input(grad_output)
+            grad_output_for_wgrad = None
             grad_biases = [None] * ctx.num_gemms
-            if ctx.fp8:
+            if prequantized_blockwise_grad_output:
+                if not ctx.fp8:
+                    raise RuntimeError(
+                        "GroupedLinear pre-quantized FP8 grad output requires FP8 enabled."
+                    )
+                if not all(isinstance(weight, Float8BlockwiseQTensorBase) for weight in weights):
+                    raise RuntimeError(
+                        "GroupedLinear pre-quantized blockwise FP8 grad output requires "
+                        "blockwise FP8 weight tensors. Use a blockwise FP8 recipe for this path."
+                    )
+                _validate_prequantized_blockwise_input(
+                    grad_output,
+                    ctx.m_splits,
+                    grad_output.size(-1),
+                )
+                grad_output_qtensor = grad_output
+                grad_output = _split_prequantized_blockwise_input(
+                    grad_output_qtensor,
+                    ctx.m_splits,
+                )
+                grad_output_view = None
+                if ctx.use_bias or ctx.weights_requires_grad:
+                    grad_output_view = grad_output_qtensor.dequantize(
+                        dtype=ctx.activation_dtype
+                    ).reshape(-1, grad_output_qtensor.size(-1))
                 if ctx.use_bias:
                     grad_output_mats = torch.split(grad_output_view, ctx.m_splits)
-                    recipe = ctx.fp8_recipe
-                    if recipe.delayed() or recipe.float8_current_scaling() or recipe.mxfp8():
-                        # Fused bias grad + quantize kernel
-                        for i in range(ctx.num_gemms):
-                            grad_biases[i], grad_output[i] = tex.bgrad_quantize(
-                                grad_output_mats[i],
-                                ctx.grad_output_quantizers[i],
+                    for i in range(ctx.num_gemms):
+                        grad_biases[i] = grad_output_mats[i].sum(dim=0)
+                if ctx.weights_requires_grad:
+                    grad_output_for_wgrad = _quantize_prequantized_blockwise_grad_output_for_wgrad(
+                        grad_output_qtensor,
+                        ctx.m_splits,
+                        ctx.grad_output_quantizers,
+                        ctx.activation_dtype,
+                    )
+            else:
+                grad_output_view = grad_output.contiguous().view(-1, grad_output.shape[-1])
+                grad_output = [None] * ctx.num_gemms
+                if ctx.fp8:
+                    if ctx.use_bias:
+                        grad_output_mats = torch.split(grad_output_view, ctx.m_splits)
+                        recipe = ctx.fp8_recipe
+                        if recipe.delayed() or recipe.float8_current_scaling() or recipe.mxfp8():
+                            # Fused bias grad + quantize kernel
+                            for i in range(ctx.num_gemms):
+                                grad_biases[i], grad_output[i] = tex.bgrad_quantize(
+                                    grad_output_mats[i],
+                                    ctx.grad_output_quantizers[i],
+                                )
+                        else:
+                            # Unfused bias grad and multi-tensor quantize
+                            for i in range(ctx.num_gemms):
+                                grad_biases[i] = grad_output_mats[i].sum(dim=0)
+                            grad_output = tex.split_quantize(
+                                grad_output_view,
+                                ctx.m_splits,
+                                ctx.grad_output_quantizers,
                             )
                     else:
-                        # Unfused bias grad and multi-tensor quantize
-                        for i in range(ctx.num_gemms):
-                            grad_biases[i] = grad_output_mats[i].sum(dim=0)
+                        # Multi-tensor quantize
                         grad_output = tex.split_quantize(
                             grad_output_view,
                             ctx.m_splits,
                             ctx.grad_output_quantizers,
                         )
                 else:
-                    # Multi-tensor quantize
-                    grad_output = tex.split_quantize(
-                        grad_output_view,
+                    # Only split grad output. Grad bias is fused with
+                    # wgrad GEMM.
+                    grad_output = torch.split(
+                        cast_if_needed(grad_output_view, ctx.activation_dtype),
                         ctx.m_splits,
-                        ctx.grad_output_quantizers,
                     )
-            else:
-                # Only split grad output. Grad bias is fused with
-                # wgrad GEMM.
-                grad_output = torch.split(
-                    cast_if_needed(grad_output_view, ctx.activation_dtype),
-                    ctx.m_splits,
-                )
+            if grad_output_for_wgrad is None:
+                grad_output_for_wgrad = grad_output
 
             if ctx.is_first_microbatch is not None:
                 accumulate_wgrad_into_param_main_grad = (
@@ -554,9 +615,13 @@ class _GroupedLinear(torch.autograd.Function):
                 )
                 # WGRAD
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
-                    ctx.wgrad_store.put([inputmats, grad_output, wgrad_list], grouped_gemm_wgrad)
+                    ctx.wgrad_store.put(
+                        [inputmats, grad_output_for_wgrad, wgrad_list], grouped_gemm_wgrad
+                    )
                 else:
-                    _, grad_biases_, _ = grouped_gemm_wgrad(inputmats, grad_output, wgrad_list)
+                    _, grad_biases_, _ = grouped_gemm_wgrad(
+                        inputmats, grad_output_for_wgrad, wgrad_list
+                    )
 
                     for i in range(ctx.num_gemms):
                         if grad_biases[i] is None:
