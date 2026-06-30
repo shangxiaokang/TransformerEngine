@@ -51,6 +51,100 @@ constexpr size_t THREADS_PER_CHUNK_X_COLWISE = CHUNK_DIM_X;                     
 constexpr size_t ITERATIONS = CHUNK_DIM_Y / BUFFER_DIM_Y;                       //    8 = 128 / 16
 static_assert(ITERATIONS >= 1);
 
+constexpr size_t BLOCKWISE_FP8_1D_BLOCK_LEN = 128;
+constexpr size_t BLOCKWISE_FP8_1D_THREADS_PER_ROW = 8;
+constexpr size_t BLOCKWISE_FP8_1D_ROWS_PER_WARP = 32 / BLOCKWISE_FP8_1D_THREADS_PER_ROW;
+constexpr size_t BLOCKWISE_FP8_1D_THREADS = 256;
+constexpr size_t BLOCKWISE_FP8_1D_NUM_WARPS = BLOCKWISE_FP8_1D_THREADS / 32;
+constexpr size_t BLOCKWISE_FP8_1D_ROWS_PER_BLOCK =
+    BLOCKWISE_FP8_1D_ROWS_PER_WARP * BLOCKWISE_FP8_1D_NUM_WARPS;
+constexpr size_t BLOCKWISE_FP8_1D_ELEMS_PER_THREAD =
+    BLOCKWISE_FP8_1D_BLOCK_LEN / BLOCKWISE_FP8_1D_THREADS_PER_ROW;
+
+template <typename IType, typename OType>
+__global__ void __launch_bounds__(BLOCKWISE_FP8_1D_THREADS)
+    dequantize_fp8_blockwise_1d_rowwise_kernel(const IType *const input, OType *const output,
+                                               const float *const scales_inv, const size_t rows,
+                                               const size_t cols, const size_t scale_stride,
+                                               const bool compact_scales) {
+  const int lane = threadIdx.x % 32;
+  const int warp = threadIdx.x / 32;
+  const int row_in_warp = lane / BLOCKWISE_FP8_1D_THREADS_PER_ROW;
+  const int lane_in_row = lane % BLOCKWISE_FP8_1D_THREADS_PER_ROW;
+  const size_t row = blockIdx.y * BLOCKWISE_FP8_1D_ROWS_PER_BLOCK +
+                     warp * BLOCKWISE_FP8_1D_ROWS_PER_WARP + row_in_warp;
+  const size_t block_col = blockIdx.x;
+  const size_t col = block_col * BLOCKWISE_FP8_1D_BLOCK_LEN +
+                     lane_in_row * BLOCKWISE_FP8_1D_ELEMS_PER_THREAD;
+  const bool valid_row = row < rows;
+  const size_t valid_elems =
+      (valid_row && col < cols)
+          ? min(static_cast<size_t>(BLOCKWISE_FP8_1D_ELEMS_PER_THREAD), cols - col)
+          : 0;
+
+  using IVec = Vec<IType, BLOCKWISE_FP8_1D_ELEMS_PER_THREAD>;
+  using OVec = Vec<OType, BLOCKWISE_FP8_1D_ELEMS_PER_THREAD>;
+
+  IVec input_vec;
+  if (valid_elems > 0) {
+    input_vec.load_from_elts(input + row * cols + col, 0, valid_elems);
+  } else {
+    input_vec.clear();
+  }
+
+  const float scale_inv = valid_row ? (compact_scales ? scales_inv[row * scale_stride + block_col]
+                                                      : scales_inv[block_col * scale_stride + row])
+                                    : 0.0f;
+
+  OVec output_vec;
+#pragma unroll
+  for (int i = 0; i < BLOCKWISE_FP8_1D_ELEMS_PER_THREAD; ++i) {
+    output_vec.data.elt[i] = static_cast<OType>(static_cast<float>(input_vec.data.elt[i]) * scale_inv);
+  }
+
+  if (valid_elems > 0) {
+    output_vec.store_to_elts(output + row * cols + col, 0, valid_elems);
+  }
+}
+
+void fp8_blockwise_1d_dequantize(const Tensor &input, Tensor *output, cudaStream_t stream) {
+  NVTE_CHECK(input.has_data(), "Cannot dequantize blockwise FP8 tensor without rowwise data.");
+  NVTE_CHECK(!input.has_columnwise_data(),
+             "Blockwise FP8 dequantization currently supports rowwise data only.");
+  NVTE_CHECK(is_fp8_dtype(input.data.dtype), "Input must have FP8 type.");
+  NVTE_CHECK(!is_fp8_dtype(output->data.dtype), "Output must be in higher precision.");
+  NVTE_CHECK(output->data.shape == input.data.shape, "Input and output shapes need to match.");
+  NVTE_CHECK(input.scale_inv.shape.size() == 2, "Blockwise FP8 scale_inv must be 2D.");
+
+  const size_t rows = input.flat_first_dim();
+  const size_t cols = input.flat_last_dim();
+  const size_t col_blocks = DIVUP(cols, BLOCKWISE_FP8_1D_BLOCK_LEN);
+  const bool compact_scales =
+      input.scale_inv.shape[0] == rows && input.scale_inv.shape[1] >= col_blocks;
+  const bool gemm_ready_scales =
+      input.scale_inv.shape[0] >= col_blocks && input.scale_inv.shape[1] >= rows;
+  NVTE_CHECK(compact_scales || gemm_ready_scales,
+             "Invalid blockwise FP8 rowwise scale_inv shape: ", input.scale_inv.shape,
+             ", expected COMPACT [", rows, ", >=", col_blocks, "] or GEMM_READY [>=",
+             col_blocks, ", >=", rows, "].");
+
+  const size_t scale_stride = input.scale_inv.shape[1];
+  const dim3 grid(col_blocks, DIVUP(rows, BLOCKWISE_FP8_1D_ROWS_PER_BLOCK));
+
+  TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(
+      input.data.dtype, IType,
+      TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+          output->data.dtype, OType,
+          dequantize_fp8_blockwise_1d_rowwise_kernel<IType, OType>
+          <<<grid, BLOCKWISE_FP8_1D_THREADS, 0, stream>>>(
+              reinterpret_cast<const IType *>(input.data.dptr),
+              reinterpret_cast<OType *>(output->data.dptr),
+              reinterpret_cast<const float *>(input.scale_inv.dptr), rows, cols, scale_stride,
+              compact_scales););  // NOLINT(*)
+  );                              // NOLINT(*)
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
+
 template <typename IType, typename OType, size_t SCALE_DIM_Y, size_t SCALE_DIM_X>
 __global__ void __launch_bounds__(THREADS_PER_CHUNK)
     dequantize_mxfp8_kernel(const __grid_constant__ CUtensorMap tensor_map_input,
@@ -428,6 +522,10 @@ void dequantize_helper(const Tensor &input, Tensor *output, cudaStream_t stream)
       } else {
         NVTE_ERROR("MXFP8 Dequantization is NOT supported by architectures < 10.0");
       }
+      break;
+    }
+    case NVTE_BLOCK_SCALING_1D: {
+      dequantization::fp8_blockwise_1d_dequantize(input, output, stream);
       break;
     }
     case NVTE_NVFP4_1D_SCALING: {

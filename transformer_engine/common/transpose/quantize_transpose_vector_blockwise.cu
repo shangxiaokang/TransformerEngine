@@ -167,6 +167,10 @@ constexpr int kNumThreadsStore = kTileDim / kNVecOut;
 static_assert(kNumThreadsLoad <= kThreadsPerWarp, "kNumThreadsLoad must be <= kThreadsPerWarp");
 static_assert(kNumThreadsStore <= kThreadsPerWarp, "kNumThreadsStore must be <= kThreadsPerWarp");
 constexpr int kNumWarps = kThreadsPerBlock / kThreadsPerWarp;
+constexpr int kRowwiseOnlyThreadsPerRow = 8;
+constexpr int kRowwiseOnlyRowsPerWarp = kThreadsPerWarp / kRowwiseOnlyThreadsPerRow;
+constexpr int kRowwiseOnlyRowsPerBlock = kNumWarps * kRowwiseOnlyRowsPerWarp;
+constexpr int kRowwiseOnlyElemsPerThread = kTileDim / kRowwiseOnlyThreadsPerRow;
 constexpr int kMaxTensorsPerBlockwiseKernel = 32;  // Keep kernel args comfortably under 4 KB.
 bool g_printed_blockwise_fp8_multi_tensor_kernel = false;
 
@@ -185,6 +189,90 @@ struct MultiBlockwiseQuantizeArgs {
   int block_range[kMaxTensorsPerBlockwiseKernel + 1];
   int num_tensors;
 };
+
+template <typename CType, typename IType, typename OType>
+__global__ void __launch_bounds__(kThreadsPerBlock) rowwise_only_1d_cast_kernel(
+    const IType* const input, OType* const output, CType* const scales_inv,
+    const size_t row_length, const size_t num_rows, const size_t scale_stride_x,
+    const size_t scale_stride_y, const float epsilon, const bool pow_2_scaling,
+    const float* noop_ptr) {
+  if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
+    return;
+  }
+
+  const int lane = threadIdx.x % kThreadsPerWarp;
+  const int warp = threadIdx.x / kThreadsPerWarp;
+  const int row_in_warp = lane / kRowwiseOnlyThreadsPerRow;
+  const int lane_in_row = lane % kRowwiseOnlyThreadsPerRow;
+  const size_t row = blockIdx.y * kRowwiseOnlyRowsPerBlock +
+                     warp * kRowwiseOnlyRowsPerWarp + row_in_warp;
+  const size_t block_col = blockIdx.x;
+  const size_t col = block_col * kTileDim + lane_in_row * kRowwiseOnlyElemsPerThread;
+  const bool valid_row = row < num_rows;
+  const size_t valid_elems =
+      (valid_row && col < row_length)
+          ? min(static_cast<size_t>(kRowwiseOnlyElemsPerThread), row_length - col)
+          : 0;
+
+  using IVec = Vec<IType, kRowwiseOnlyElemsPerThread>;
+  using OVec = Vec<OType, kRowwiseOnlyElemsPerThread>;
+
+  IVec input_vec;
+  if (valid_elems > 0) {
+    input_vec.load_from_elts(input + row * row_length + col, 0, valid_elems);
+  } else {
+    input_vec.clear();
+  }
+
+  CType amax = 0;
+#pragma unroll
+  for (int i = 0; i < kRowwiseOnlyElemsPerThread; ++i) {
+    __builtin_assume(amax >= 0);
+    amax = fmaxf(amax, fabsf(static_cast<float>(input_vec.data.elt[i])));
+  }
+
+  const unsigned src_lane = (lane / kRowwiseOnlyThreadsPerRow) * kRowwiseOnlyThreadsPerRow;
+  const unsigned mask = ((1u << kRowwiseOnlyThreadsPerRow) - 1u) << src_lane;
+#pragma unroll
+  for (int delta = kRowwiseOnlyThreadsPerRow / 2; delta > 0; delta /= 2) {
+    const float other_amax = __shfl_down_sync(mask, amax, delta);
+    __builtin_assume(amax >= 0);
+    __builtin_assume(other_amax >= 0);
+    amax = fmaxf(amax, other_amax);
+  }
+  amax = __shfl_sync(mask, amax, src_lane);
+
+  const CType scale = compute_scale_from_types<IType, OType>(amax, epsilon, pow_2_scaling);
+  if (valid_row && lane_in_row == 0) {
+    scales_inv[row * scale_stride_y + block_col * scale_stride_x] = 1.0f / scale;
+  }
+
+  OVec output_vec;
+#pragma unroll
+  for (int i = 0; i < kRowwiseOnlyElemsPerThread; ++i) {
+    output_vec.data.elt[i] =
+        static_cast<OType>(static_cast<CType>(input_vec.data.elt[i]) * scale);
+  }
+  if (valid_elems > 0) {
+    output_vec.store_to_elts(output + row * row_length + col, 0, valid_elems);
+  }
+}
+
+template <typename InputType, typename OutputType>
+void launch_rowwise_only_1d_cast_kernel(
+    const SimpleTensor& input, SimpleTensor& scale_inv, SimpleTensor& output,
+    const size_t row_length, const size_t num_rows, const size_t scale_stride_x,
+    const size_t scale_stride_y, const float epsilon, const bool pow2_scale,
+    const float* noop_ptr, cudaStream_t stream) {
+  const dim3 grid(DIVUP(row_length, static_cast<size_t>(kTileDim)),
+                  DIVUP(num_rows, static_cast<size_t>(kRowwiseOnlyRowsPerBlock)), 1);
+  rowwise_only_1d_cast_kernel<float, InputType, OutputType>
+      <<<grid, kThreadsPerBlock, 0, stream>>>(
+          reinterpret_cast<const InputType*>(input.dptr), reinterpret_cast<OutputType*>(output.dptr),
+          reinterpret_cast<float*>(scale_inv.dptr), row_length, num_rows, scale_stride_x,
+          scale_stride_y, epsilon, pow2_scale, noop_ptr);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
 
 template <bool kAligned, typename CType, typename IType, typename OType>
 __device__ __forceinline__ void block_scaled_1d_cast_transpose_impl(
@@ -553,6 +641,104 @@ __global__ void __launch_bounds__(kThreadsPerBlock) block_scaled_1d_cast_transpo
       static_cast<size_t>(blockIdx.y), smem);
 }
 
+template <typename CType, typename IType, typename OType>
+__global__ void __launch_bounds__(kThreadsPerBlock) multi_rowwise_only_1d_cast_kernel(
+    MultiBlockwiseQuantizeArgs args, const float epsilon, const bool pow_2_scaling,
+    const float* noop_ptr) {
+  if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
+    return;
+  }
+
+  int tensor_id = 0;
+  const int bid = blockIdx.x;
+  while (args.block_range[tensor_id + 1] <= bid) {
+    ++tensor_id;
+  }
+
+  const size_t row_length = static_cast<size_t>(args.row_length_list[tensor_id]);
+  const size_t num_rows = static_cast<size_t>(args.num_rows_list[tensor_id]);
+  const size_t num_tiles_x = DIVUP(row_length, static_cast<size_t>(kTileDim));
+  const int tile_id = bid - args.block_range[tensor_id];
+  const size_t block_col = static_cast<size_t>(tile_id) % num_tiles_x;
+  const size_t row_tile = static_cast<size_t>(tile_id) / num_tiles_x;
+
+  const int lane = threadIdx.x % kThreadsPerWarp;
+  const int warp = threadIdx.x / kThreadsPerWarp;
+  const int row_in_warp = lane / kRowwiseOnlyThreadsPerRow;
+  const int lane_in_row = lane % kRowwiseOnlyThreadsPerRow;
+  const size_t row = row_tile * kRowwiseOnlyRowsPerBlock + warp * kRowwiseOnlyRowsPerWarp +
+                     row_in_warp;
+  const size_t col = block_col * kTileDim + lane_in_row * kRowwiseOnlyElemsPerThread;
+  const bool valid_row = row < num_rows;
+  const size_t valid_elems =
+      (valid_row && col < row_length)
+          ? min(static_cast<size_t>(kRowwiseOnlyElemsPerThread), row_length - col)
+          : 0;
+
+  using IVec = Vec<IType, kRowwiseOnlyElemsPerThread>;
+  using OVec = Vec<OType, kRowwiseOnlyElemsPerThread>;
+
+  const IType* input = reinterpret_cast<const IType*>(args.input_list[tensor_id]);
+  OType* output = reinterpret_cast<OType*>(args.output_c_list[tensor_id]);
+  CType* scales_inv = reinterpret_cast<CType*>(args.scale_inv_c_list[tensor_id]);
+  const size_t scale_stride_x = static_cast<size_t>(args.scale_stride_x_list[tensor_id]);
+  const size_t scale_stride_y = static_cast<size_t>(args.scale_stride_y_list[tensor_id]);
+
+  IVec input_vec;
+  if (valid_elems > 0) {
+    input_vec.load_from_elts(input + row * row_length + col, 0, valid_elems);
+  } else {
+    input_vec.clear();
+  }
+
+  CType amax = 0;
+#pragma unroll
+  for (int i = 0; i < kRowwiseOnlyElemsPerThread; ++i) {
+    __builtin_assume(amax >= 0);
+    amax = fmaxf(amax, fabsf(static_cast<float>(input_vec.data.elt[i])));
+  }
+
+  const unsigned src_lane = (lane / kRowwiseOnlyThreadsPerRow) * kRowwiseOnlyThreadsPerRow;
+  const unsigned mask = ((1u << kRowwiseOnlyThreadsPerRow) - 1u) << src_lane;
+#pragma unroll
+  for (int delta = kRowwiseOnlyThreadsPerRow / 2; delta > 0; delta /= 2) {
+    const float other_amax = __shfl_down_sync(mask, amax, delta);
+    __builtin_assume(amax >= 0);
+    __builtin_assume(other_amax >= 0);
+    amax = fmaxf(amax, other_amax);
+  }
+  amax = __shfl_sync(mask, amax, src_lane);
+
+  const CType scale = compute_scale_from_types<IType, OType>(amax, epsilon, pow_2_scaling);
+  if (valid_row && lane_in_row == 0) {
+    scales_inv[row * scale_stride_y + block_col * scale_stride_x] = 1.0f / scale;
+  }
+
+  OVec output_vec;
+#pragma unroll
+  for (int i = 0; i < kRowwiseOnlyElemsPerThread; ++i) {
+    output_vec.data.elt[i] =
+        static_cast<OType>(static_cast<CType>(input_vec.data.elt[i]) * scale);
+  }
+  if (valid_elems > 0) {
+    output_vec.store_to_elts(output + row * row_length + col, 0, valid_elems);
+  }
+}
+
+template <typename InputType, typename OutputType>
+void launch_multi_rowwise_only_1d_cast_kernel(const MultiBlockwiseQuantizeArgs& kernel_args,
+                                              const float epsilon, const bool pow_2_scaling,
+                                              const float* noop_ptr, cudaStream_t stream) {
+  if (kernel_args.num_tensors == 0) {
+    return;
+  }
+
+  const int n_blocks = kernel_args.block_range[kernel_args.num_tensors];
+  multi_rowwise_only_1d_cast_kernel<float, InputType, OutputType>
+      <<<n_blocks, kThreadsPerBlock, 0, stream>>>(kernel_args, epsilon, pow_2_scaling, noop_ptr);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
+
 template <bool kAligned, typename CType, typename IType, typename OType>
 __global__ void __launch_bounds__(kThreadsPerBlock) multi_block_scaled_1d_cast_transpose_kernel(
     MultiBlockwiseQuantizeArgs args, const float epsilon,
@@ -706,6 +892,20 @@ void quantize_transpose_vector_blockwise(const SimpleTensor& input, SimpleTensor
   const size_t num_blocks_y = DIVUP(num_rows, (size_t)kTileDim);
 
   const float* noop_ptr = reinterpret_cast<const float*>(noop_tensor.dptr);
+  const bool rowwise_only = rowwise_option != FP8BlockwiseRowwiseOption::NONE &&
+                            columnwise_option == FP8BlockwiseColumnwiseOption::NONE;
+
+  if (rowwise_only) {
+    TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
+        input.dtype, InputType,
+        TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(
+            output_dtype, OutputType,
+            launch_rowwise_only_1d_cast_kernel<InputType, OutputType>(
+                input, scale_inv, output, row_length, num_rows, scale_stride_x, scale_stride_y,
+                epsilon, pow2_scale, noop_ptr, stream);)  // OutputType
+    )                                                     // InputType
+    return;
+  }
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
       input.dtype, InputType,
@@ -790,6 +990,9 @@ void multi_quantize_transpose_vector_blockwise(
   reset_kernel_args(kernel_args_aligned);
   reset_kernel_args(kernel_args_unaligned);
 
+  const bool rowwise_only = rowwise_option != FP8BlockwiseRowwiseOption::NONE &&
+                            columnwise_option == FP8BlockwiseColumnwiseOption::NONE;
+
   auto launch_kernel_args = [&](MultiBlockwiseQuantizeArgs& args, bool aligned) {
     if (args.num_tensors == 0) {
       return;
@@ -798,14 +1001,18 @@ void multi_quantize_transpose_vector_blockwise(
         input_dtype, InputType,
         TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(
             output_dtype, OutputType,
-            TRANSFORMER_ENGINE_SWITCH_CONDITION(
-                aligned, kAligned,
-                launch_multi_block_scaled_1d_cast_transpose_kernel<kAligned, InputType,
-                                                                   OutputType>(
-                    args, epsilon, rowwise_option, columnwise_option, pow2_scale, noop_ptr,
-                    stream);)  // kAligned
-        )                      // OutputType
-    )                          // InputType
+            if (rowwise_only) {
+              launch_multi_rowwise_only_1d_cast_kernel<InputType, OutputType>(
+                  args, epsilon, pow2_scale, noop_ptr, stream);
+            } else {
+              TRANSFORMER_ENGINE_SWITCH_CONDITION(
+                  aligned, kAligned,
+                  launch_multi_block_scaled_1d_cast_transpose_kernel<kAligned, InputType,
+                                                                     OutputType>(
+                      args, epsilon, rowwise_option, columnwise_option, pow2_scale, noop_ptr,
+                      stream);)  // kAligned
+            })                   // OutputType
+    )                            // InputType
     reset_kernel_args(args);
   };
 
@@ -883,7 +1090,9 @@ void multi_quantize_transpose_vector_blockwise(
     }
 
     const size_t num_tiles_x = DIVUP(row_length, static_cast<size_t>(kTileDim));
-    const size_t num_tiles_y = DIVUP(num_rows, static_cast<size_t>(kTileDim));
+    const size_t num_tile_rows = rowwise_only ? static_cast<size_t>(kRowwiseOnlyRowsPerBlock)
+                                              : static_cast<size_t>(kTileDim);
+    const size_t num_tiles_y = DIVUP(num_rows, num_tile_rows);
     const size_t num_tiles = num_tiles_x * num_tiles_y;
     if (num_tiles == 0) {
       continue;
@@ -899,7 +1108,8 @@ void multi_quantize_transpose_vector_blockwise(
     }
 
     const bool aligned = row_length % kTileDim == 0 && num_rows % kTileDim == 0;
-    auto& kernel_args = aligned ? kernel_args_aligned : kernel_args_unaligned;
+    auto& kernel_args = rowwise_only ? kernel_args_aligned
+                                     : (aligned ? kernel_args_aligned : kernel_args_unaligned);
     if (kernel_args.num_tensors == kMaxTensorsPerBlockwiseKernel) {
       launch_kernel_args(kernel_args, aligned);
     }

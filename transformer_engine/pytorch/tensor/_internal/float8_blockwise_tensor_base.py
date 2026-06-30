@@ -16,10 +16,35 @@ from transformer_engine_torch import Float8BlockScaleTensorFormat
 from ..quantized_tensor import QuantizedTensorBase
 
 from ...constants import TE_DType_To_Torch
+from ...constants import TE_DType as torch_to_transformer_engine_dtype
 
 from ..quantized_tensor import Quantizer
 
 from ...utils import _empty_tensor
+
+
+class _FromFloat8BlockwiseFunc(torch.autograd.Function):
+    """Cast rowwise blockwise FP8 tensors to a high-precision dtype."""
+
+    @staticmethod
+    def forward(
+        _ctx: Optional[torch.autograd.function.FunctionCtx],
+        tensor: Float8BlockwiseQTensorBase,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        te_dtype = torch_to_transformer_engine_dtype[dtype]
+        if tensor._rowwise_data is None:
+            raise NotImplementedError("Blockwise FP8 fused dequant requires rowwise data.")
+        if tensor._rowwise_data.numel() == 0:
+            return torch.empty_like(tensor._rowwise_data, dtype=dtype)
+        return tex.dequantize(tensor, te_dtype)
+
+    @staticmethod
+    def backward(
+        _ctx: torch.autograd.function.FunctionCtx,
+        grad: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], ...]:
+        return grad, None
 
 
 class Float8BlockwiseQTensorBase(QuantizedTensorBase):
@@ -233,6 +258,15 @@ class Float8BlockwiseQTensorBase(QuantizedTensorBase):
         """
         block_len = 128
         if not self._is_2D_scaled:
+            if (
+                self._rowwise_data is not None
+                and self._columnwise_data is None
+                and self._data_format == Float8BlockScaleTensorFormat.COMPACT
+                and self._rowwise_data.is_cuda
+            ):
+                if torch.is_grad_enabled() and isinstance(self, torch.Tensor):
+                    return _FromFloat8BlockwiseFunc.apply(self, dtype)
+                return _FromFloat8BlockwiseFunc.forward(None, self, dtype)
             return self._dequantize_vectorwise(dtype=dtype)
 
         if not self._is_gemm_ready_format():
