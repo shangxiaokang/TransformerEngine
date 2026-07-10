@@ -243,6 +243,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("split_quantize", &transformer_engine::pytorch::split_quantize,
         "Split and multi-tensor quantize", py::arg("tensor"), py::arg("split_sections"),
         py::arg("quantizer_list"));
+  m.def("split_activation_quantize", &transformer_engine::pytorch::split_activation_quantize,
+        "Split, apply activation, and multi-tensor quantize", py::arg("tensor"),
+        py::arg("split_sections"), py::arg("quantizer_list"), py::arg("activation"));
   m.def("split_bgrad_quantize", &transformer_engine::pytorch::split_bgrad_quantize,
         "Split, compute bias gradients, and multi-tensor quantize", py::arg("tensor"),
         py::arg("split_sections"), py::arg("quantizer_list"));

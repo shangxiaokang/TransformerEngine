@@ -8,6 +8,7 @@
 #define TRANSFORMER_ENGINE_PYTORCH_CSRC_EXTENSIONS_H_
 
 #include <optional>
+#include <string>
 
 #include "common.h"
 
@@ -251,6 +252,10 @@ std::vector<py::object> multi_tensor_quantize(const std::vector<at::Tensor> &ten
 std::vector<py::object> split_quantize(const at::Tensor &tensor,
                                        const std::vector<int> &split_sections,
                                        std::vector<py::handle> quantizer_list);
+std::vector<py::object> split_activation_quantize(const at::Tensor &tensor,
+                                                   const std::vector<int> &split_sections,
+                                                   std::vector<py::handle> quantizer_list,
+                                                   const std::string &activation);
 std::tuple<std::vector<at::Tensor>, std::vector<py::object>> split_bgrad_quantize(
     const at::Tensor &tensor, const std::vector<int> &split_sections,
     std::vector<py::handle> quantizer_list);

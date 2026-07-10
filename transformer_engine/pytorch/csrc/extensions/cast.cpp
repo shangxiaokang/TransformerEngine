@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -653,6 +654,64 @@ std::vector<py::object> split_quantize(const at::Tensor &tensor,
   return output_py_list;
 }
 
+std::vector<py::object> split_activation_quantize(const at::Tensor &tensor,
+                                                   const std::vector<int> &split_sections,
+                                                   std::vector<py::handle> quantizer_list,
+                                                   const std::string &activation) {
+  init_extension();
+
+  const size_t num_splits = split_sections.size();
+  NVTE_CHECK(quantizer_list.size() == num_splits, "Expected ", num_splits,
+             " quantizers, but got ", quantizer_list.size());
+  if (num_splits == 0) {
+    return {};
+  }
+
+  const bool is_swiglu = activation == "swiglu";
+  const bool is_srelu = activation == "srelu";
+  NVTE_CHECK(is_swiglu || is_srelu,
+             "split_activation_quantize only supports swiglu and srelu, got ", activation);
+
+  auto input_py = tensor.contiguous();
+  NVTE_CHECK(input_py.is_cuda(), "split_activation_quantize expects a CUDA tensor");
+  std::vector<size_t> input_shape;
+  input_shape.reserve(input_py.dim());
+  for (const auto &d : input_py.sizes()) {
+    input_shape.push_back(d);
+  }
+  NVTE_CHECK(input_shape.size() > 0, "Input tensor has 0 dims");
+
+  size_t split_total = 0;
+  for (const auto split : split_sections) {
+    NVTE_CHECK(split >= 0, "Attempted to split tensor with negative split section: ", split);
+    split_total += static_cast<size_t>(split);
+  }
+  NVTE_CHECK(split_total == input_shape[0], "Split sections must sum to input dim 0. Got ",
+             split_total, " but input dim 0 is ", input_shape[0]);
+
+  auto output_shape = input_shape;
+  if (is_swiglu) {
+    NVTE_CHECK(output_shape.back() % 2 == 0,
+               "SwiGLU input last dimension must be even, got shape=", input_shape);
+    output_shape.back() /= 2;
+  }
+
+  std::vector<int64_t> output_shape_i64(output_shape.begin(), output_shape.end());
+  auto activation_output = at::empty(output_shape_i64, input_py.options());
+  auto input_cpp = makeTransformerEngineTensor(input_py);
+  auto activation_output_cpp = makeTransformerEngineTensor(activation_output);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  NVTE_SCOPED_GIL_RELEASE({
+    if (is_swiglu) {
+      nvte_swiglu(input_cpp.data(), activation_output_cpp.data(), stream);
+    } else {
+      nvte_srelu(input_cpp.data(), activation_output_cpp.data(), stream);
+    }
+  });
+
+  return split_quantize(activation_output, split_sections, quantizer_list);
+}
 
 std::tuple<std::vector<at::Tensor>, std::vector<py::object>> split_bgrad_quantize(
     const at::Tensor &tensor, const std::vector<int> &split_sections,

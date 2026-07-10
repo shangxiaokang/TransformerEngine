@@ -449,9 +449,18 @@ class _LayerNormMLP(torch.autograd.Function):
         else:
             fc1_out, *_ = fc1_outputs
             if fp8 and FP8GlobalStateManager.get_fp8_recipe().float8_block_scaling():
-                # tex.quantize does not support GELU fusion for blockwise.
-                act_out = activation_func(fc1_out, None)
-                act_out = tex.quantize(act_out, fc2_input_quantizer)
+                # Blockwise activation fusion is available for the MLP middle activations.
+                if activation in ("swiglu", "srelu"):
+                    act_out = tex.split_activation_quantize(
+                        fc1_out,
+                        [fc1_out.size(0)],
+                        [fc2_input_quantizer],
+                        activation,
+                    )[0]
+                else:
+                    # tex.quantize does not support GELU fusion for blockwise.
+                    act_out = activation_func(fc1_out, None)
+                    act_out = tex.quantize(act_out, fc2_input_quantizer)
             else:
                 if fp8_calibration:
                     act_out = activation_func(fc1_out, None)
