@@ -292,11 +292,18 @@ class _GroupedLinear(torch.autograd.Function):
                                 grad_output_mats[i],
                                 ctx.grad_output_quantizers[i],
                             )
-                    else:
-                        # Unfused bias grad and multi-tensor quantize
+                    elif recipe.nvfp4() or getattr(recipe, "grad_block_scaling_dim", 1) != 1:
+                        # Keep NVFP4 and 2D blockwise grad quantization on the existing path.
                         for i in range(ctx.num_gemms):
                             grad_biases[i] = grad_output_mats[i].sum(dim=0)
                         grad_output = tex.split_quantize(
+                            grad_output_view,
+                            ctx.m_splits,
+                            ctx.grad_output_quantizers,
+                        )
+                    else:
+                        # Grouped bias grad + grouped quantize for 1D blockwise FP8.
+                        grad_biases, grad_output = tex.split_bgrad_quantize(
                             grad_output_view,
                             ctx.m_splits,
                             ctx.grad_output_quantizers,

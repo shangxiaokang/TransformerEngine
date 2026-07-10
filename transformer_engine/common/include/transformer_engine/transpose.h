@@ -106,6 +106,18 @@ void nvte_multi_quantize_transpose_vector_blockwise(size_t num_tensors,
                                                     NVTETensor* output_list,
                                                     const NVTEQuantizationConfig quant_config,
                                                     cudaStream_t stream);
+/*! \brief Compute bias gradients for multiple tensors.
+ *
+ *  Each input tensor is flattened to [M, K] and reduced along M. The corresponding dbias
+ *  tensor must be 1D with K elements and use the same dtype as the input tensor.
+ *
+ *  \param[in]     num_tensors         Number of tensors.
+ *  \param[in]     input_list          List of input tensors.
+ *  \param[out]    dbias_list          List of bias gradient tensors.
+ *  \param[in]     stream              CUDA stream used for the operation.
+ */
+void nvte_multi_dbias(size_t num_tensors, const NVTETensor* input_list, NVTETensor* dbias_list,
+                      cudaStream_t stream);
 
 /*! \brief Compute backward of GeLU operation on the input, then cast and transpose.
  *         Additionally, reduce the result of the GeLU backward along the first dimension.

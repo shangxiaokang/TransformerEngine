@@ -68,6 +68,8 @@ void multi_quantize_transpose_vector_blockwise(
     const float epsilon, FP8BlockwiseRowwiseOption rowwise_option,
     FP8BlockwiseColumnwiseOption columnwise_option, const bool pow_2_scale,
     const SimpleTensor &noop_tensor, cudaStream_t stream);
+void multi_dbias(const std::vector<Tensor *> &input_list, std::vector<Tensor *> &dbias_list,
+                 cudaStream_t stream);
 
 void quantize_transpose_vector_blockwise_fp4(
     const SimpleTensor &input, const SimpleTensor &global_amax, SimpleTensor &scale_inv,

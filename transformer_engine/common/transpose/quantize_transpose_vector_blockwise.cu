@@ -623,11 +623,151 @@ void launch_multi_block_scaled_1d_cast_transpose_kernel(
           kernel_args, epsilon, rowwise_option, columnwise_option, pow_2_scaling, noop_ptr);
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
+constexpr int kDbiasColsPerBlock = 32;
+constexpr int kDbiasThreadsPerBlock = 256;
+constexpr int kDbiasThreadsPerColumn = kDbiasThreadsPerBlock / kDbiasColsPerBlock;
+static_assert(kDbiasThreadsPerBlock % kDbiasColsPerBlock == 0,
+              "dbias threads must divide evenly across columns");
+
+struct MultiDbiasArgs {
+  void* input_list[kMaxTensorsPerBlockwiseKernel];
+  void* dbias_list[kMaxTensorsPerBlockwiseKernel];
+  int row_length_list[kMaxTensorsPerBlockwiseKernel];
+  int num_rows_list[kMaxTensorsPerBlockwiseKernel];
+  int block_range[kMaxTensorsPerBlockwiseKernel + 1];
+  int num_tensors;
+};
+
+template <typename IType>
+__global__ void multi_dbias_kernel(const MultiDbiasArgs args) {
+  int tensor_id = 0;
+  while (tensor_id + 1 < args.num_tensors && blockIdx.x >= args.block_range[tensor_id + 1]) {
+    ++tensor_id;
+  }
+
+  const int tile_id = blockIdx.x - args.block_range[tensor_id];
+  const int col_lane = threadIdx.x / kDbiasThreadsPerColumn;
+  const int row_lane = threadIdx.x % kDbiasThreadsPerColumn;
+  const int col = tile_id * kDbiasColsPerBlock + col_lane;
+  const int row_length = args.row_length_list[tensor_id];
+  const bool valid_col = col < row_length;
+  const unsigned active_mask = __ballot_sync(0xffffffff, valid_col);
+
+  const int num_rows = args.num_rows_list[tensor_id];
+  const IType* input = reinterpret_cast<const IType*>(args.input_list[tensor_id]);
+  IType* dbias = reinterpret_cast<IType*>(args.dbias_list[tensor_id]);
+
+  if (valid_col) {
+    float partial = 0.0f;
+    for (int row = row_lane; row < num_rows; row += kDbiasThreadsPerColumn) {
+      partial += static_cast<float>(input[static_cast<size_t>(row) * row_length + col]);
+    }
+
+#pragma unroll
+    for (int offset = kDbiasThreadsPerColumn / 2; offset > 0; offset >>= 1) {
+      partial += __shfl_down_sync(active_mask, partial, offset, kDbiasThreadsPerColumn);
+    }
+
+    if (row_lane == 0) {
+      dbias[col] = static_cast<IType>(partial);
+    }
+  }
+}
+
+template <typename InputType>
+void launch_multi_dbias_kernel(const MultiDbiasArgs& kernel_args, cudaStream_t stream) {
+  if (kernel_args.num_tensors == 0) {
+    return;
+  }
+
+  const int n_blocks = kernel_args.block_range[kernel_args.num_tensors];
+  if (n_blocks == 0) {
+    return;
+  }
+  multi_dbias_kernel<InputType><<<n_blocks, kDbiasThreadsPerBlock, 0, stream>>>(kernel_args);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
 
 }  // namespace
 }  // namespace transformer_engine
 
 namespace transformer_engine::detail {
+void multi_dbias(const std::vector<Tensor*>& input_list, std::vector<Tensor*>& dbias_list,
+                 cudaStream_t stream) {
+  NVTE_API_CALL(multi_dbias);
+
+  NVTE_CHECK(input_list.size() == dbias_list.size(),
+             "Number of input and dbias tensors must match.");
+  if (input_list.empty()) {
+    return;
+  }
+
+  const DType input_dtype = input_list[0]->data.dtype;
+
+  auto check_int_range = [](size_t value, const char* name) -> int {
+    NVTE_CHECK(value <= static_cast<size_t>(std::numeric_limits<int>::max()), name,
+               " exceeds int range: ", value);
+    return static_cast<int>(value);
+  };
+
+  auto reset_kernel_args = [](MultiDbiasArgs& args) {
+    args.num_tensors = 0;
+    args.block_range[0] = 0;
+  };
+
+  MultiDbiasArgs kernel_args;
+  reset_kernel_args(kernel_args);
+
+  auto launch_kernel_args = [&]() {
+    if (kernel_args.num_tensors == 0) {
+      return;
+    }
+    TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
+        input_dtype, InputType, launch_multi_dbias_kernel<InputType>(kernel_args, stream););
+    reset_kernel_args(kernel_args);
+  };
+
+  for (size_t tensor_id = 0; tensor_id < input_list.size(); ++tensor_id) {
+    const auto& input = input_list[tensor_id]->data;
+    auto& dbias = dbias_list[tensor_id]->data;
+
+    NVTE_CHECK(input.dtype == input_dtype, "Input tensor types do not match.");
+    NVTE_CHECK(dbias.dtype == input_dtype, "Dbias tensor type must match input tensor type.");
+
+    const size_t row_length = input.shape.size() > 0 ? input.shape.at(input.shape.size() - 1) : 1u;
+    size_t num_rows = 1;
+    for (size_t i = 0; (i < input.shape.size() - 1) && (input.shape.size() > 0); ++i) {
+      num_rows *= input.shape.at(i);
+    }
+
+    NVTE_CHECK(dbias.shape.size() == 1, "Dbias tensor must be 1D.");
+    NVTE_CHECK(dbias.shape[0] == row_length, "Dbias size must match input last dimension.");
+
+    if (row_length == 0) {
+      continue;
+    }
+    if (num_rows > 0) {
+      NVTE_CHECK(input.dptr != nullptr, "Input data pointer must not be null.");
+    }
+    NVTE_CHECK(dbias.dptr != nullptr, "Dbias data pointer must not be null.");
+
+    if (kernel_args.num_tensors == kMaxTensorsPerBlockwiseKernel) {
+      launch_kernel_args();
+    }
+
+    const size_t num_col_tiles = DIVUP(row_length, static_cast<size_t>(kDbiasColsPerBlock));
+    const int pos = kernel_args.num_tensors;
+    kernel_args.input_list[pos] = input.dptr;
+    kernel_args.dbias_list[pos] = dbias.dptr;
+    kernel_args.row_length_list[pos] = check_int_range(row_length, "Row length");
+    kernel_args.num_rows_list[pos] = check_int_range(num_rows, "Number of rows");
+    kernel_args.block_range[pos + 1] =
+        kernel_args.block_range[pos] + check_int_range(num_col_tiles, "Number of dbias tiles");
+    ++kernel_args.num_tensors;
+  }
+
+  launch_kernel_args();
+}
 
 void quantize_transpose_vector_blockwise(const SimpleTensor& input, SimpleTensor& scale_inv,
                                          SimpleTensor& scale_inv_t, SimpleTensor& output,
@@ -980,4 +1120,20 @@ void nvte_multi_quantize_transpose_vector_blockwise(size_t num_tensors,
   detail::multi_quantize_transpose_vector_blockwise(
       input_list_, output_list_, quant_config_cpp.amax_epsilon, rowwise_option, columnwise_option,
       quant_config_cpp.force_pow_2_scales, noop_tensor->data, stream);
+}
+
+void nvte_multi_dbias(size_t num_tensors, const NVTETensor* input_list, NVTETensor* dbias_list,
+                      cudaStream_t stream) {
+  NVTE_API_CALL(nvte_multi_dbias);
+  using namespace transformer_engine;
+
+  std::vector<Tensor*> input_list_, dbias_list_;
+  input_list_.reserve(num_tensors);
+  dbias_list_.reserve(num_tensors);
+  for (size_t i = 0; i < num_tensors; ++i) {
+    input_list_.push_back(convertNVTETensorCheck(input_list[i]));
+    dbias_list_.push_back(convertNVTETensorCheck(dbias_list[i]));
+  }
+
+  detail::multi_dbias(input_list_, dbias_list_, stream);
 }
