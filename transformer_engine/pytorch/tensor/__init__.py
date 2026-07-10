@@ -7,11 +7,15 @@
 import torch
 
 from .quantized_tensor import QuantizedTensor, Quantizer
+from .storage.grouped_tensor_storage import GroupedTensorStorage
+from .grouped_tensor import GroupedTensor
 from .utils import cast_master_weights_to_fp8, replace_raw_data
 
 __all__ = [
     "QuantizedTensor",
     "Quantizer",
+    "GroupedTensorStorage",
+    "GroupedTensor",
 ]
 
 
@@ -55,6 +59,7 @@ def get_all_tensor_types():
         Float8BlockwiseQTensorBase,
     )
     from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Tensor, NVFP4TensorBase
+    from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
 
     all_tensor_types = [
         torch.Tensor,
@@ -67,5 +72,6 @@ def get_all_tensor_types():
         Float8BlockwiseQTensorBase,
         NVFP4Tensor,
         NVFP4TensorBase,
+        GroupedTensor,
     ]
     return all_tensor_types
