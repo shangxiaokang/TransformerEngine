@@ -120,6 +120,10 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
   // Set conditions for MXFP8 and NVFP4 gemm execution.
   const auto nvfp4 = is_nvfp_scaling(A.scaling_mode) && is_nvfp_scaling(B.scaling_mode);
   const auto mxfp8 = !nvfp4 && is_mxfp_scaling(A.scaling_mode) && is_mxfp_scaling(B.scaling_mode);
+  int is_nvte_non_tn_fp8_gemm_supported = 0;  // needed only for per tensor scaling
+  if (is_tensor_scaling(A.scaling_mode) || is_tensor_scaling(B.scaling_mode)) {
+    is_nvte_non_tn_fp8_gemm_supported = nvte_is_non_tn_fp8_gemm_supported();
+  }
 
   // Configure A matrix
   if (is_tensor_scaling(A.scaling_mode)) {
@@ -129,7 +133,7 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
     ret.Atype = A.data.dtype;
     ret.A_scale_inv = A.scale_inv.dptr;
     ret.lda = is_A_transposed ? k : m;
-    if (!nvte_is_non_tn_fp8_gemm_supported() && !is_A_transposed) {
+    if (!is_nvte_non_tn_fp8_gemm_supported && !is_A_transposed) {
       // Hopper only supports TN GEMMs for FP8. "Column-wise data" is transpose of data.
       if (A.has_columnwise_data() && is_fp8_dtype(A.columnwise_data.dtype)) {
         ret.A = A.columnwise_data.dptr;
@@ -140,6 +144,22 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
       } else {
         NVTE_CHECK(!is_fp8_dtype(ret.Atype), "Input A is missing column-wise usage");
       }
+    } else if (is_nvte_non_tn_fp8_gemm_supported && !A.has_data()) {
+      // Blackwell supports any GEMM layout for FP8, so we can use column-wise/transposed
+      // data  with the mirrored transpose-flag if we don't have row-wise data.
+      NVTE_CHECK(A.has_columnwise_data() && is_fp8_dtype(A.columnwise_data.dtype),
+                 "Input A is missing column-wise usage");
+      ret.A = A.columnwise_data.dptr;
+      ret.transA = is_A_transposed ? CUBLAS_OP_N : CUBLAS_OP_T;
+      ret.Atype = A.columnwise_data.dtype;
+      ret.A_scale_inv = A.columnwise_scale_inv.dptr;
+      ret.lda = is_A_transposed ? m : k;
+    }
+
+    if (is_fp8_dtype(ret.Atype)) {
+      // Requirements from https://docs.nvidia.com/cuda/cublas/#tensor-core-usage
+      NVTE_CHECK(ret.lda % 16 == 0,
+                 "Leading dimension requirement on A for FP8 GEMM. Caller must pad.");
     }
   } else if (nvfp4) {
     // NVFP4 GEMM. Either the pure NVFP4 recipe or the FWD pass of the Hybrid NVFP4/MXFP8 recipe.
@@ -204,7 +224,7 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
     ret.Btype = B.data.dtype;
     ret.B_scale_inv = B.scale_inv.dptr;
     ret.ldb = is_B_transposed ? n : k;
-    if (!nvte_is_non_tn_fp8_gemm_supported() && is_B_transposed) {
+    if (!is_nvte_non_tn_fp8_gemm_supported && is_B_transposed) {
       // Hopper only supports TN GEMMs for FP8. "Column-wise data" is transpose of data.
       if (B.has_columnwise_data() && is_fp8_dtype(B.columnwise_data.dtype)) {
         ret.B = B.columnwise_data.dptr;
@@ -215,6 +235,22 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
       } else {
         NVTE_CHECK(!is_fp8_dtype(ret.Btype), "Input B is missing column-wise usage");
       }
+    } else if (is_nvte_non_tn_fp8_gemm_supported && !B.has_data()) {
+      // Blackwell supports any GEMM layout for FP8, so we can use column-wise/transposed
+      // data with the mirrored transpose-flag if we don't have row-wise data.
+      NVTE_CHECK(B.has_columnwise_data() && is_fp8_dtype(B.columnwise_data.dtype),
+                 "Input B is missing column-wise usage");
+      ret.B = B.columnwise_data.dptr;
+      ret.transB = is_B_transposed ? CUBLAS_OP_N : CUBLAS_OP_T;
+      ret.Btype = B.columnwise_data.dtype;
+      ret.B_scale_inv = B.columnwise_scale_inv.dptr;
+      ret.ldb = is_B_transposed ? k : n;
+    }
+
+    if (is_fp8_dtype(ret.Atype)) {
+      // Requirements from https://docs.nvidia.com/cuda/cublas/#tensor-core-usage
+      NVTE_CHECK(ret.ldb % 16 == 0,
+                 "Leading dimension requirement on B for FP8 GEMM. Caller must pad.");
     }
   } else if (nvfp4) {
     if (is_B_transposed) {
