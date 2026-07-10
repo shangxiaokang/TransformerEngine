@@ -4,7 +4,7 @@
 
 """Tensor class with FP8 data quantized with NxN tiles"""
 from __future__ import annotations
-from typing import Optional, Tuple, Iterable, Union
+from typing import Any, Optional, Tuple, Iterable, Union
 
 import math
 import torch
@@ -429,6 +429,28 @@ class Float8BlockwiseQTensor(Float8BlockwiseQTensorBase, QuantizedTensor):
                 )
             return Float8BlockwiseQTensor.make_like(tensor)
 
+        # as_strided op: applied by FSDP2 on the unsharded param. When shape
+        # and strides match, return a tensor wrapper copy to preserve type.
+        if func == aten.as_strided.default:
+            tensor = args[0]
+            shape = args[1]
+            strides = args[2]
+            if (
+                len(shape) == len(strides) == 2
+                and tuple(strides) == (shape[-1], 1)
+                and tuple(shape) == tuple(tensor.size())
+            ):
+                return Float8BlockwiseQTensor.make_like(tensor)
+
+        # slice op: applied by FSDP2 when shards need unpadding. Preserve type
+        # when the slice covers the whole dimension.
+        if func == aten.slice.Tensor:
+            tensor = args[0]
+            dim = args[1]
+            start = args[2]
+            length = args[3]
+            if start == 0 and length == tensor.size(dim):
+                return Float8BlockwiseQTensor.make_like(tensor)
         # Default case
         return super().__torch_dispatch__(func, types, args, kwargs)
 
@@ -574,7 +596,91 @@ class Float8BlockwiseQTensor(Float8BlockwiseQTensorBase, QuantizedTensor):
         if self._columnwise_data is not None:
             return self._columnwise_data.is_cuda
         raise RuntimeError("Float8BlockwiseQTensor has no data!")
+    def fsdp_pre_all_gather(self, mesh, orig_size, contiguous_orig_stride, module, mp_policy):
+        """Called by FSDP2 before all-gather of weights for forward/backward."""
+        # pylint: disable=unused-argument
+        if not self._is_2D_scaled:
+            raise NotImplementedError(
+                "FSDP2 is only supported for Float8BlockwiseQTensors with 2D block scaling "
+                "(block_scaling_dim=2). 1D block scaling is not supported because the scale "
+                "layout has M in dim1, which is incompatible with FSDP2 dim0 all-gather."
+            )
 
+        block_len = self._quantizer.block_len
+        rowwise_data = self._rowwise_data
+        rowwise_scale_inv = self._rowwise_scale_inv
+        columnwise_data = self._columnwise_data
+        columnwise_scale_inv = self._columnwise_scale_inv
+
+        if columnwise_data is not None:
+            columnwise_data = columnwise_data.t().contiguous()
+
+        if columnwise_scale_inv is not None:
+            shard_m = math.prod(self.shape[:-1])
+            m_blocks = (shard_m + block_len - 1) // block_len
+            columnwise_scale_inv = columnwise_scale_inv[:, :m_blocks]
+            columnwise_scale_inv = columnwise_scale_inv.t().contiguous()
+
+        rowwise_usage = True
+        sharded_tensors = (rowwise_data, rowwise_scale_inv)
+        columnwise_usage = self._quantizer.columnwise_usage
+        if columnwise_usage:
+            sharded_tensors += (columnwise_data, columnwise_scale_inv)
+
+        metadata = (self._fp8_dtype, self._is_2D_scaled, rowwise_usage, columnwise_usage)
+        return sharded_tensors, metadata
+
+    def fsdp_post_all_gather(
+        self,
+        all_gather_outputs: Tuple[torch.Tensor, ...],
+        metadata: Any,
+        param_dtype: torch.dtype,
+        *,
+        out: Optional[Float8BlockwiseQTensor] = None,
+    ):
+        """Called by FSDP2 after all-gather of weights for forward/backward."""
+        fp8_dtype, is_2D_scaled, rowwise_usage, columnwise_usage = metadata
+        rowwise_data, rowwise_scale_inv = all_gather_outputs[:2] if rowwise_usage else (None, None)
+        columnwise_data, columnwise_scale_inv = (
+            all_gather_outputs[-2:] if columnwise_usage else (None, None)
+        )
+
+        if columnwise_data is not None:
+            columnwise_data = columnwise_data.t().contiguous()
+
+        if columnwise_scale_inv is not None:
+            columnwise_scale_inv = columnwise_scale_inv.t().contiguous()
+            current_m_blocks = columnwise_scale_inv.shape[1]
+            pad_amount = (4 - current_m_blocks % 4) % 4
+            if pad_amount > 0:
+                columnwise_scale_inv = torch.nn.functional.pad(
+                    columnwise_scale_inv, (0, pad_amount)
+                )
+
+        if rowwise_data is not None:
+            data_shape = rowwise_data.shape
+        else:
+            data_shape = (columnwise_data.shape[1], columnwise_data.shape[0])
+
+        if out is not None:
+            out._rowwise_data = rowwise_data
+            out._rowwise_scale_inv = rowwise_scale_inv
+            out._columnwise_data = columnwise_data
+            out._columnwise_scale_inv = columnwise_scale_inv
+        else:
+            out = Float8BlockwiseQTensor(
+                shape=data_shape,
+                dtype=param_dtype,
+                fp8_dtype=fp8_dtype,
+                rowwise_data=rowwise_data,
+                rowwise_scale_inv=rowwise_scale_inv,
+                columnwise_data=columnwise_data,
+                columnwise_scale_inv=columnwise_scale_inv,
+                quantizer=self._quantizer,
+                is_2D_scaled=is_2D_scaled,
+            )
+        out._quantizer.set_usage(rowwise=rowwise_usage, columnwise=columnwise_usage)
+        return out, all_gather_outputs
 
 class _ViewFunc(torch.autograd.Function):
     """View function
