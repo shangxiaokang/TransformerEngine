@@ -10,7 +10,6 @@ import torch
 import triton
 import triton.language as tl
 
-from triton.language import core
 from triton.language.standard import _log2
 
 
@@ -37,7 +36,14 @@ def _compare_and_swap(x, indices, flip, i: tl.constexpr, n_dims: tl.constexpr):
     l_indice = tl.reshape(tl.broadcast_to(tl.sum(z * (1 - mask), 1)[:, None, :], shape), x.shape)
     r_indice = tl.reshape(tl.broadcast_to(tl.sum(z * mask, 1)[:, None, :], shape), x.shape)
 
-    idtype = core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
+    if x.dtype.primitive_bitwidth == 64:
+        idtype = tl.int64
+    elif x.dtype.primitive_bitwidth == 32:
+        idtype = tl.int32
+    elif x.dtype.primitive_bitwidth == 16:
+        idtype = tl.int16
+    else:
+        idtype = tl.int8
 
     il_value = l_value.to(idtype, bitcast=True)
     ir_value = r_value.to(idtype, bitcast=True)

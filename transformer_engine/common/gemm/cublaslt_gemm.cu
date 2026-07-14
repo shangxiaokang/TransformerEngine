@@ -504,7 +504,8 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
       NVTE_CHECK(inputB->with_gemm_swizzled_scales,
                  "MXFP8 scales are not in format expected by GEMM");
 
-      // Configure cuBLAS scales      fp8e8m0 *A_scale_inverse = reinterpret_cast<fp8e8m0 *>(param.A_scale_inv);
+      // Configure cuBLAS scales
+      fp8e8m0 *A_scale_inverse = reinterpret_cast<fp8e8m0 *>(param.A_scale_inv);
       fp8e8m0 *B_scale_inverse = reinterpret_cast<fp8e8m0 *>(param.B_scale_inv);
       NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
                                                        CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
@@ -539,7 +540,8 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
                  "NVFP4 block scales are not in format expected by GEMM");
 
       // alpha and beta are device pointers to FP32
-      const cublasDataType_t scale_type = CUDA_R_32F;      NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
+      const cublasDataType_t scale_type = CUDA_R_32F;
+      NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
           operationDesc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
 
       // Set pointer mode: alpha and beta are both device pointers
@@ -576,7 +578,8 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
                  "Only 1D by 1D, 1D by 2D, and 2D by 1D block scaling GEMM is supported, "
                  "but got 2D by 2D");
 
-      // Configure cuBLAS scales      float *A_scale_inverse = reinterpret_cast<float *>(param.A_scale_inv);
+      // Configure cuBLAS scales
+      float *A_scale_inverse = reinterpret_cast<float *>(param.A_scale_inv);
       float *B_scale_inverse = reinterpret_cast<float *>(param.B_scale_inv);
       NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
                                                        CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
