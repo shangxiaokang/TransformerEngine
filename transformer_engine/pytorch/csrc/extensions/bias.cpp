@@ -7,6 +7,8 @@
 #include <ATen/ATen.h>
 #include <pybind11/pybind11.h>
 
+#include <memory>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -101,6 +103,120 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
   });
 
   return {py::cast(std::move(grad_bias_torch)), std::move(grad_input_py)};
+}
+
+std::tuple<std::vector<at::Tensor>, std::vector<py::object>> split_bgrad_quantize(
+    const at::Tensor &tensor, const std::vector<int> &split_sections,
+    std::vector<py::handle> quantizer_list) {
+  init_extension();
+
+  const size_t num_splits = split_sections.size();
+  NVTE_CHECK(quantizer_list.size() == num_splits, "Expected ", num_splits,
+             " quantizers, but got ", quantizer_list.size());
+  if (num_splits == 0) {
+    return {{}, {}};
+  }
+
+  auto input_py = tensor.contiguous();
+  NVTE_CHECK(input_py.dim() > 0, "Input tensor has 0 dims");
+  auto input_dtype = GetTransformerEngineDType(input_py.scalar_type());
+
+  std::vector<int64_t> split_sections_i64;
+  split_sections_i64.reserve(num_splits);
+  size_t split_total = 0;
+  for (const auto split : split_sections) {
+    NVTE_CHECK(split >= 0, "Attempted to split tensor with negative split section: ", split);
+    split_sections_i64.push_back(static_cast<int64_t>(split));
+    split_total += static_cast<size_t>(split);
+  }
+  NVTE_CHECK(split_total == static_cast<size_t>(input_py.size(0)),
+             "Split sections must sum to input dim 0. Got ", split_total,
+             " but input dim 0 is ", input_py.size(0));
+
+  auto split_tensors = input_py.split_with_sizes(split_sections_i64, 0);
+  auto fallback = [&]() -> std::tuple<std::vector<at::Tensor>, std::vector<py::object>> {
+    std::vector<at::Tensor> grad_bias_list;
+    std::vector<py::object> quantized_list;
+    grad_bias_list.reserve(num_splits);
+    quantized_list.reserve(num_splits);
+    for (size_t i = 0; i < num_splits; ++i) {
+      auto result = bgrad_quantize(split_tensors[i], quantizer_list[i]);
+      grad_bias_list.emplace_back(result[0].cast<at::Tensor>());
+      quantized_list.emplace_back(std::move(result[1]));
+    }
+    return {std::move(grad_bias_list), std::move(quantized_list)};
+  };
+
+  std::vector<std::unique_ptr<Quantizer>> quantizer_cpp_list;
+  quantizer_cpp_list.reserve(num_splits);
+  bool with_blockwise_fused_kernel = true;
+  Float8BlockQuantizer *first_blockwise_quantizer = nullptr;
+  for (size_t i = 0; i < num_splits; ++i) {
+    quantizer_cpp_list.push_back(convert_quantizer(quantizer_list[i]));
+    if (!detail::IsFloat8BlockwiseQuantizers(quantizer_list[i].ptr())) {
+      with_blockwise_fused_kernel = false;
+      break;
+    }
+
+    auto *blockwise_quantizer = dynamic_cast<Float8BlockQuantizer *>(quantizer_cpp_list[i].get());
+    if (blockwise_quantizer == nullptr ||
+        blockwise_quantizer->get_scaling_mode() != NVTE_BLOCK_SCALING_1D) {
+      with_blockwise_fused_kernel = false;
+      break;
+    }
+
+    if (i == 0) {
+      first_blockwise_quantizer = blockwise_quantizer;
+      continue;
+    }
+
+    if (blockwise_quantizer->dtype != first_blockwise_quantizer->dtype ||
+        blockwise_quantizer->force_pow_2_scales !=
+            first_blockwise_quantizer->force_pow_2_scales ||
+        blockwise_quantizer->amax_epsilon != first_blockwise_quantizer->amax_epsilon ||
+        blockwise_quantizer->all_gather_usage != first_blockwise_quantizer->all_gather_usage ||
+        blockwise_quantizer->rowwise_usage != first_blockwise_quantizer->rowwise_usage ||
+        blockwise_quantizer->columnwise_usage != first_blockwise_quantizer->columnwise_usage) {
+      with_blockwise_fused_kernel = false;
+      break;
+    }
+  }
+
+  if (!with_blockwise_fused_kernel || first_blockwise_quantizer == nullptr) {
+    return fallback();
+  }
+
+  std::vector<at::Tensor> grad_bias_torch_list;
+  std::vector<TensorWrapper> input_cpp_list;
+  std::vector<TensorWrapper> grad_bias_cpp_list;
+  grad_bias_torch_list.reserve(num_splits);
+  input_cpp_list.reserve(num_splits);
+  grad_bias_cpp_list.reserve(num_splits);
+  for (size_t i = 0; i < num_splits; ++i) {
+    input_cpp_list.emplace_back(makeTransformerEngineTensor(split_tensors[i]));
+    const int64_t bias_size = split_tensors[i].size(split_tensors[i].dim() - 1);
+    auto grad_bias_torch = allocateTorchTensor(bias_size, input_dtype);
+    grad_bias_cpp_list.emplace_back(makeTransformerEngineTensor(grad_bias_torch));
+    grad_bias_torch_list.emplace_back(std::move(grad_bias_torch));
+  }
+
+  std::vector<NVTETensor> nvte_tensor_input_list;
+  std::vector<NVTETensor> nvte_tensor_dbias_list;
+  nvte_tensor_input_list.reserve(num_splits);
+  nvte_tensor_dbias_list.reserve(num_splits);
+  for (size_t i = 0; i < num_splits; ++i) {
+    nvte_tensor_input_list.push_back(input_cpp_list[i].data());
+    nvte_tensor_dbias_list.push_back(grad_bias_cpp_list[i].data());
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_multi_dbias(nvte_tensor_input_list.size(), nvte_tensor_input_list.data(),
+                     nvte_tensor_dbias_list.data(), stream);
+  });
+
+  auto quantized_list = split_quantize(input_py, split_sections, quantizer_list);
+  return {std::move(grad_bias_torch_list), std::move(quantized_list)};
 }
 
 namespace {

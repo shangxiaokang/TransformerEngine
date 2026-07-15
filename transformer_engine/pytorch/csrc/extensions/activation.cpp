@@ -194,6 +194,34 @@ py::object gelu(const at::Tensor& input, py::handle quantizer) {
   return activation_forward(nvte_gelu, input, quantizer);
 }
 
+
+std::vector<py::object> split_activation_quantize(const at::Tensor &tensor,
+                                                   const std::vector<int> &split_sections,
+                                                   std::vector<py::handle> quantizer_list,
+                                                   const std::string &activation) {
+  const bool is_swiglu = activation == "swiglu";
+  const bool is_srelu = activation == "srelu";
+  NVTE_CHECK(is_swiglu || is_srelu,
+             "split_activation_quantize only supports swiglu and srelu, got ", activation);
+  NVTE_CHECK(tensor.dim() > 0, "Input tensor has 0 dims");
+  if (is_swiglu) {
+    NVTE_CHECK(tensor.size(tensor.dim() - 1) % 2 == 0,
+               "SwiGLU input last dimension must be even, got ", tensor.size(tensor.dim() - 1));
+  }
+
+  size_t split_total = 0;
+  for (const auto split : split_sections) {
+    NVTE_CHECK(split >= 0, "Attempted to split tensor with negative split section: ", split);
+    split_total += static_cast<size_t>(split);
+  }
+  NVTE_CHECK(split_total == static_cast<size_t>(tensor.size(0)),
+             "Split sections must sum to input dim 0. Got ", split_total,
+             " but input dim 0 is ", tensor.size(0));
+
+  py::object activation_output = is_swiglu ? swiglu(tensor, py::none()) : srelu(tensor, py::none());
+  return split_quantize(activation_output.cast<at::Tensor>(), split_sections, quantizer_list);
+}
+
 py::object dgelu(const at::Tensor& grad, const at::Tensor& input, py::handle quantizer) {
   return activation_backward(nvte_dgelu, grad, input, quantizer);
 }
