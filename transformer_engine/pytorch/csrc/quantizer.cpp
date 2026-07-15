@@ -59,6 +59,10 @@ std::vector<T> convert_shape_for_fp4(const std::vector<T>& shape) {
   return ret;
 }
 
+py::handle grouped_tensor_python_class(const bool internal) {
+  PyTypeObject *cls = internal ? GroupedTensorStoragePythonClass : GroupedTensorPythonClass;
+  return py::handle(reinterpret_cast<PyObject *>(cls));
+}
 }  // namespace
 
 constexpr size_t NVFP4_BLOCK_SIZE = 16;

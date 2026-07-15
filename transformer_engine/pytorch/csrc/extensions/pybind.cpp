@@ -36,6 +36,8 @@ PyTypeObject *Float8BlockwiseQuantizerClass = nullptr;
 PyTypeObject *NVFP4TensorPythonClass = nullptr;
 PyTypeObject *NVFP4TensorBasePythonClass = nullptr;
 PyTypeObject *NVFP4QuantizerClass = nullptr;
+PyTypeObject *GroupedTensorPythonClass = nullptr;
+PyTypeObject *GroupedTensorStoragePythonClass = nullptr;
 std::once_flag extension_init_flag;
 
 void init_float8_extension() {
@@ -102,12 +104,24 @@ void init_nvfp4_extensions() {
              "Internal error: could not initialize pyTorch NVFP4 extension.");
 }
 
+void init_grouped_tensor_extension() {
+  auto grouped_module = py::module_::import("transformer_engine.pytorch.tensor.grouped_tensor");
+  GroupedTensorPythonClass = reinterpret_cast<PyTypeObject *>(
+      PyObject_GetAttrString(grouped_module.ptr(), "GroupedTensor"));
+  auto grouped_storage_module =
+      py::module_::import("transformer_engine.pytorch.tensor.storage.grouped_tensor_storage");
+  GroupedTensorStoragePythonClass = reinterpret_cast<PyTypeObject *>(
+      PyObject_GetAttrString(grouped_storage_module.ptr(), "GroupedTensorStorage"));
+  NVTE_CHECK(GroupedTensorPythonClass != nullptr && GroupedTensorStoragePythonClass != nullptr,
+             "Internal error: could not initialize pyTorch GroupedTensor extension.");
+}
 void init_extension() {
   std::call_once(extension_init_flag, []() {
     init_float8_extension();
     init_mxfp8_extension();
     init_float8blockwise_extension();
     init_nvfp4_extensions();
+    init_grouped_tensor_extension();
   });
 }
 

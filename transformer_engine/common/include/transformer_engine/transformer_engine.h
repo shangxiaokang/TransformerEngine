@@ -13,6 +13,7 @@
 
 #include <cuda_runtime_api.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -415,6 +416,8 @@ enum NVTEGroupedTensorParam {
   kNVTEGroupedLastDims = 8,  /*!< Last dimension sizes (device pointer to int64_t array) */
   kNVTEGroupedTensorOffsets =
       9, /*!< Tensor offsets for contiguous layout (device pointer to int64_t array) */
+  kNVTEGroupedWithGEMMSwizzledScales =
+      10, /*!< Whether scaling factors are in format expected by GEMM */
   kNVTENumGroupedTensorParams
 };
 
@@ -451,8 +454,8 @@ void nvte_destroy_grouped_tensor(NVTEGroupedTensor tensor);
  *  \param[in] param_name The parameter to be set.
  *  \param[in] param The value to be set (NVTEBasicTensor).
  */
-void nvte_set_grouped_tensor_param(NVTEGroupedTensor *tensor, NVTEGroupedTensorParam param_name,
-                                   const NVTEBasicTensor *param);
+void nvte_set_grouped_tensor_param(NVTEGroupedTensor tensor, NVTEGroupedTensorParam param,
+                                   const void *buf, size_t size_in_bytes);
 
 /* EXPERIMENTAL FEATURE AND SUBJECT TO CHANGE. */
 /*! \brief Get a value of the parameter of the grouped tensor.
@@ -462,8 +465,8 @@ void nvte_set_grouped_tensor_param(NVTEGroupedTensor *tensor, NVTEGroupedTensorP
  *
  *  \return NVTEBasicTensor containing the parameter data.
  */
-NVTEBasicTensor nvte_get_grouped_tensor_param(const NVTEGroupedTensor tensor,
-                                              NVTEGroupedTensorParam param_name);
+void nvte_get_grouped_tensor_param(const NVTEGroupedTensor tensor, NVTEGroupedTensorParam param,
+                                   void *buf, size_t size_in_bytes, size_t *size_written);
 
 /* EXPERIMENTAL FEATURE AND SUBJECT TO CHANGE. */
 /*! \brief Get the number of tensors in a grouped tensor.
@@ -900,6 +903,174 @@ class TensorWrapper {
   NVTETensor tensor_ = nullptr;
 };
 
+/*! \struct GroupedTensorWrapper
+ *  \brief C++ wrapper for the NVTEGroupedTensor class.
+ */
+class GroupedTensorWrapper {
+ public:
+  GroupedTensorWrapper(const size_t num_tensors, const NVTEShape &logical_shape,
+                       const NVTEScalingMode scaling_mode = NVTE_DELAYED_TENSOR_SCALING)
+      : tensor_(nvte_create_grouped_tensor(scaling_mode, num_tensors, logical_shape)) {}
+
+  GroupedTensorWrapper(const size_t num_tensors, const std::vector<size_t> &logical_shape,
+                       const NVTEScalingMode scaling_mode = NVTE_DELAYED_TENSOR_SCALING)
+      : GroupedTensorWrapper(num_tensors, nvte_make_shape(logical_shape.data(), logical_shape.size()),
+                             scaling_mode) {}
+
+  ~GroupedTensorWrapper() { nvte_destroy_grouped_tensor(tensor_); }
+
+  GroupedTensorWrapper &operator=(const GroupedTensorWrapper &other) = delete;
+  GroupedTensorWrapper(const GroupedTensorWrapper &other) = delete;
+
+  GroupedTensorWrapper(GroupedTensorWrapper &&other) {
+    tensor_ = other.tensor_;
+    other.tensor_ = nullptr;
+  }
+
+  GroupedTensorWrapper &operator=(GroupedTensorWrapper &&other) {
+    if (this == &other) return *this;
+    nvte_destroy_grouped_tensor(tensor_);
+    tensor_ = other.tensor_;
+    other.tensor_ = nullptr;
+    return *this;
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_parameter(const NVTEGroupedTensorParam param, void *dptr, DType type,
+                                      const ShapeType &shape) noexcept {
+    NVTEShape nvte_shape = this->convertShape(shape);
+    NVTEBasicTensor data = {dptr, static_cast<NVTEDType>(type), nvte_shape};
+    nvte_set_grouped_tensor_param(tensor_, param, &data, sizeof(data));
+    return *this;
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_rowwise_data(void *dptr, DType type, const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedRowwiseData, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_columnwise_data(void *dptr, DType type,
+                                            const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedColumnwiseData, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_scale(void *dptr, DType type, const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedScale, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_amax(void *dptr, DType type, const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedAmax, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_rowwise_scale_inv(void *dptr, DType type,
+                                              const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedRowwiseScaleInv, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_columnwise_scale_inv(void *dptr, DType type,
+                                                 const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedColumnwiseScaleInv, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_columnwise_amax(void *dptr, DType type,
+                                            const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedColumnwiseAmax, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_first_dims(void *dptr, DType type, const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedFirstDims, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_last_dims(void *dptr, DType type, const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedLastDims, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_tensor_offsets(void *dptr, DType type,
+                                           const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedTensorOffsets, dptr, type, shape);
+  }
+
+  void set_with_gemm_swizzled_scales(bool with_gemm_swizzled_scales) {
+    const auto val = static_cast<uint8_t>(with_gemm_swizzled_scales);
+    nvte_set_grouped_tensor_param(tensor_, kNVTEGroupedWithGEMMSwizzledScales, &val, sizeof(val));
+  }
+
+  NVTEBasicTensor get_parameter(const NVTEGroupedTensorParam param) const noexcept {
+    NVTEBasicTensor ret;
+    nvte_get_grouped_tensor_param(tensor_, param, &ret, sizeof(ret), nullptr);
+    return ret;
+  }
+
+  NVTEBasicTensor get_rowwise_data() const noexcept { return get_parameter(kNVTEGroupedRowwiseData); }
+  NVTEBasicTensor get_columnwise_data() const noexcept {
+    return get_parameter(kNVTEGroupedColumnwiseData);
+  }
+  NVTEBasicTensor get_scale() const noexcept { return get_parameter(kNVTEGroupedScale); }
+  NVTEBasicTensor get_amax() const noexcept { return get_parameter(kNVTEGroupedAmax); }
+  NVTEBasicTensor get_rowwise_scale_inv() const noexcept {
+    return get_parameter(kNVTEGroupedRowwiseScaleInv);
+  }
+  NVTEBasicTensor get_columnwise_scale_inv() const noexcept {
+    return get_parameter(kNVTEGroupedColumnwiseScaleInv);
+  }
+  NVTEBasicTensor get_columnwise_amax() const noexcept {
+    return get_parameter(kNVTEGroupedColumnwiseAmax);
+  }
+  NVTEBasicTensor get_first_dims() const noexcept { return get_parameter(kNVTEGroupedFirstDims); }
+  NVTEBasicTensor get_last_dims() const noexcept { return get_parameter(kNVTEGroupedLastDims); }
+  NVTEBasicTensor get_tensor_offsets() const noexcept {
+    return get_parameter(kNVTEGroupedTensorOffsets);
+  }
+
+  bool get_with_gemm_swizzled_scales() const {
+    uint8_t val = 0;
+    nvte_get_grouped_tensor_param(tensor_, kNVTEGroupedWithGEMMSwizzledScales, &val, sizeof(val),
+                                  nullptr);
+    return static_cast<bool>(val);
+  }
+
+  NVTEGroupedTensor data() const noexcept { return tensor_; }
+
+  size_t num_tensors() const noexcept {
+    if (tensor_ == nullptr) return 0;
+    return nvte_grouped_tensor_num_tensors(tensor_);
+  }
+
+  DType dtype() const noexcept {
+    if (tensor_ == nullptr) return DType::kNumTypes;
+    return static_cast<DType>(nvte_grouped_tensor_type(tensor_));
+  }
+
+  NVTEScalingMode scaling_mode() const noexcept {
+    if (tensor_ == nullptr) return NVTE_DELAYED_TENSOR_SCALING;
+    return nvte_grouped_tensor_scaling_mode(tensor_);
+  }
+
+  const NVTEShape logical_shape() const noexcept {
+    if (tensor_ == nullptr) {
+      return nvte_make_shape(nullptr, 0);
+    }
+    return nvte_get_grouped_tensor_logical_shape(tensor_);
+  }
+
+ private:
+  NVTEShape convertShape(const NVTEShape &s) { return s; }
+
+  NVTEShape convertShape(const std::vector<size_t> &s) {
+    return nvte_make_shape(s.data(), s.size());
+  }
+
+  NVTEGroupedTensor tensor_ = nullptr;
+};
 /*! \enum Float8BlockScaleTensorFormat
  *  \brief Data format for an FP8 block-scaled tensor
  */
