@@ -73,10 +73,12 @@ Quantizer::Quantizer(const py::handle& quantizer) {
     this->rowwise_usage = true;
     this->columnwise_usage = true;
     this->internal = false;
+    this->optimize_for_gemm = false;
   } else {
     this->rowwise_usage = quantizer.attr("rowwise_usage").cast<bool>();
     this->columnwise_usage = quantizer.attr("columnwise_usage").cast<bool>();
     this->internal = quantizer.attr("internal").cast<bool>();
+    this->optimize_for_gemm = quantizer.attr("optimize_for_gemm").cast<bool>();
     this->quantizer = quantizer;
   }
 }

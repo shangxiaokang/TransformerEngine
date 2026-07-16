@@ -68,6 +68,7 @@ enum NVTETensorParam {
   kNVTERowwiseScaleInv = 4,    /*!< Scale inverse tensor for decoding Rowwise Data */
   kNVTEColumnwiseScaleInv = 5, /*!< Scale inverse tensor for decoding Columnwise Data */
   kNVTEColumnwiseAmax = 6,     /*!< Columnwise Amax tensor */
+  kNVTEWithGEMMSwizzledScales = 7, /*!< Whether scaling factors are in format expected by GEMM */
   kNVTENumTensorParams
 };
 
@@ -278,6 +279,14 @@ void nvte_set_tensor_param(NVTETensor *tensor, NVTETensorParam param_name,
  *  \param[in] param_name The parameter to be set.
  */
 NVTEBasicTensor nvte_get_tensor_param(const NVTETensor tensor, NVTETensorParam param_name);
+
+/*! \brief Set a tensor parameter. */
+void nvte_set_tensor_param_v2(NVTETensor tensor, NVTETensorParam param, const void *buf,
+                              size_t size_in_bytes);
+
+/*! \brief Query a tensor parameter. */
+void nvte_get_tensor_param_v2(const NVTETensor tensor, NVTETensorParam param, void *buf,
+                              size_t size_in_bytes, size_t *size_written);
 
 /*! \brief Get the granularity of scaling of this tensor.
  *
@@ -697,6 +706,11 @@ class TensorWrapper {
     return set_parameter(kNVTEColumnwiseAmax, dptr, type, shape);
   }
 
+  void set_with_gemm_swizzled_scales(bool with_gemm_swizzled_scales) {
+    const auto val = static_cast<uint8_t>(with_gemm_swizzled_scales);
+    nvte_set_tensor_param_v2(tensor_, kNVTEWithGEMMSwizzledScales, &val, sizeof(val));
+  }
+
   // Parameter getters
 
   NVTEBasicTensor get_parameter(const NVTETensorParam param) const noexcept {
@@ -725,6 +739,11 @@ class TensorWrapper {
     return get_parameter(kNVTEColumnwiseAmax);
   }
 
+  bool get_with_gemm_swizzled_scales() const {
+    uint8_t val = 0;
+    nvte_get_tensor_param_v2(tensor_, kNVTEWithGEMMSwizzledScales, &val, sizeof(val), nullptr);
+    return static_cast<bool>(val);
+  }
   /*! \brief Get an underlying NVTETensor.
    *
    *  \return NVTETensor held by this TensorWrapper.

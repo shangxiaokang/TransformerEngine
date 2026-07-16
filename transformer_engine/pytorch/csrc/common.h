@@ -103,6 +103,12 @@ class Quantizer {
   virtual std::pair<TensorWrapper, py::object> create_tensor(const std::vector<size_t>& shape,
                                                              DType dtype) const = 0;
 
+  /*! @brief Construct a grouped tensor with uninitialized data */
+  virtual std::pair<GroupedTensorWrapper, py::object> create_grouped_tensor(
+      size_t num_tensors, const std::vector<size_t>& logical_shape, DType dtype,
+      py::object quantizer, const std::optional<at::Tensor>& first_dims, size_t logical_first_dim,
+      size_t logical_last_dim) const = 0;
+
   /*! @brief Convert a PyTorch tensor into a Transformer Engine C++ tensor
    *
    * The PyTorch tensor's attributes are modified to match the
@@ -120,6 +126,7 @@ class Quantizer {
   bool rowwise_usage = true;
   bool columnwise_usage = true;
   bool internal = false;
+  bool optimize_for_gemm = false;
   py::handle quantizer;
 
  protected:
@@ -136,6 +143,11 @@ class NoneQuantizer : public Quantizer {
 
   std::pair<TensorWrapper, py::object> create_tensor(const std::vector<size_t>& shape,
                                                      DType dtype) const override;
+
+  std::pair<GroupedTensorWrapper, py::object> create_grouped_tensor(
+      size_t num_tensors, const std::vector<size_t>& logical_shape, DType dtype,
+      py::object quantizer, const std::optional<at::Tensor>& first_dims, size_t logical_first_dim,
+      size_t logical_last_dim) const override;
 
   /*! @brief Construct a tensor with pre-initialized data */
   std::pair<TensorWrapper, py::object> create_tensor(const std::vector<size_t>& shape, DType dtype,
@@ -162,6 +174,11 @@ class Float8Quantizer : public Quantizer {
 
   std::pair<TensorWrapper, py::object> create_tensor(const std::vector<size_t>& shape,
                                                      DType dtype) const override;
+
+  std::pair<GroupedTensorWrapper, py::object> create_grouped_tensor(
+      size_t num_tensors, const std::vector<size_t>& logical_shape, DType dtype,
+      py::object quantizer, const std::optional<at::Tensor>& first_dims, size_t logical_first_dim,
+      size_t logical_last_dim) const override;
 
   /*! @brief Construct a tensor with pre-initialized data */
   std::pair<TensorWrapper, py::object> create_tensor(const std::vector<size_t>& shape, DType dtype,
@@ -194,6 +211,11 @@ class Float8CurrentScalingQuantizer : public Quantizer {
 
   std::pair<TensorWrapper, py::object> create_tensor(const std::vector<size_t>& shape,
                                                      DType dtype) const override;
+
+  std::pair<GroupedTensorWrapper, py::object> create_grouped_tensor(
+      size_t num_tensors, const std::vector<size_t>& logical_shape, DType dtype,
+      py::object quantizer, const std::optional<at::Tensor>& first_dims, size_t logical_first_dim,
+      size_t logical_last_dim) const override;
 
   /*! @brief Construct an unquantized tensor that shares the quantizer's amax pointer.
    *
@@ -254,6 +276,11 @@ class Float8BlockQuantizer : public Quantizer {
   std::pair<TensorWrapper, py::object> create_tensor(const std::vector<size_t>& shape,
                                                      DType dtype) const override;
 
+  std::pair<GroupedTensorWrapper, py::object> create_grouped_tensor(
+      size_t num_tensors, const std::vector<size_t>& logical_shape, DType dtype,
+      py::object quantizer, const std::optional<at::Tensor>& first_dims, size_t logical_first_dim,
+      size_t logical_last_dim) const override;
+
   std::pair<TensorWrapper, py::object> convert_and_update_tensor(py::object shape) const override;
 
   void quantize(const TensorWrapper& input, TensorWrapper& out,
@@ -274,6 +301,11 @@ class MXFP8Quantizer : public Quantizer {
 
   std::pair<TensorWrapper, py::object> create_tensor(const std::vector<size_t>& shape,
                                                      DType dtype) const override;
+
+  std::pair<GroupedTensorWrapper, py::object> create_grouped_tensor(
+      size_t num_tensors, const std::vector<size_t>& logical_shape, DType dtype,
+      py::object quantizer, const std::optional<at::Tensor>& first_dims, size_t logical_first_dim,
+      size_t logical_last_dim) const override;
 
   std::pair<TensorWrapper, py::object> convert_and_update_tensor(py::object shape) const override;
 
@@ -308,6 +340,11 @@ class NVFP4Quantizer : public Quantizer {
 
   std::pair<TensorWrapper, py::object> create_tensor(const std::vector<size_t>& shape,
                                                      DType dtype) const override;
+
+  std::pair<GroupedTensorWrapper, py::object> create_grouped_tensor(
+      size_t num_tensors, const std::vector<size_t>& logical_shape, DType dtype,
+      py::object quantizer, const std::optional<at::Tensor>& first_dims, size_t logical_first_dim,
+      size_t logical_last_dim) const override;
 
   /*! @brief Construct an unquantized tensor that shares NVFP4 tensor's amax pointer
    *
@@ -358,6 +395,7 @@ inline size_t typeToNumBits(transformer_engine::DType t) {
     case transformer_engine::DType::kByte:
     case transformer_engine::DType::kFloat8E4M3:
     case transformer_engine::DType::kFloat8E5M2:
+    case transformer_engine::DType::kFloat8E8M0:
       return 8;
     case transformer_engine::DType::kFloat4E2M1:
       return 4;
@@ -386,6 +424,8 @@ inline at::ScalarType GetATenDType(transformer_engine::DType t) {
       return at::kFloat8_e4m3fn;
     case transformer_engine::DType::kFloat8E5M2:
       return at::kFloat8_e5m2;
+    case transformer_engine::DType::kFloat8E8M0:
+      return at::kByte;
     default:
       NVTE_ERROR("Invalid type");
   }
@@ -478,6 +518,8 @@ void* getDataPtr(at::Tensor tensor, int offset = 0);
 std::vector<size_t> convertShape(const NVTEShape& shape);
 
 size_t roundup(const size_t value, const size_t multiple);
+
+size_t ceildiv(const size_t numer, const size_t denom);
 
 NVTEShape convertTorchShape(const c10::IntArrayRef torch_shape);
 

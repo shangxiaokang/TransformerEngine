@@ -305,6 +305,11 @@ size_t roundup(const size_t value, const size_t multiple) {
   return ((value + multiple - 1) / multiple) * multiple;
 }
 
+size_t ceildiv(const size_t numer, const size_t denom) {
+  assert(denom > 0);
+  return (numer + denom - 1) / denom;
+}
+
 void philox_unpack(at::PhiloxCudaState arg, int64_t* rng_state_ptr) {
   NVTE_SCOPED_GIL_RELEASE({
     nvte_extract_seed_and_offset(rng_state_ptr, arg.captured_, arg.seed_.ptr, arg.seed_.val,

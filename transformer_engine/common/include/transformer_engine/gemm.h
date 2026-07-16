@@ -337,6 +337,9 @@ void nvte_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGroupedT
                        NVTETensor workspace_cublas, NVTEGroupedMatmulConfig config,
                        cudaStream_t stream);
 
+/*! \brief Return the required size in bytes for the setup workspace of grouped GEMM. */
+size_t nvte_get_grouped_gemm_setup_workspace_size(size_t num_tensors);
+
 /* EXPERIMENTAL FEATURE AND SUBJECT TO CHANGE. */
 /*! \brief Grouped matrix multiplication with discrete A input tensors.
  *

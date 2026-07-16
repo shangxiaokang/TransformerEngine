@@ -789,6 +789,104 @@ NVTEBasicTensor nvte_get_tensor_param(const NVTETensor tensor, NVTETensorParam p
   }
 }
 
+void nvte_set_tensor_param_v2(NVTETensor tensor, NVTETensorParam param, const void *buf,
+                              size_t size_in_bytes) {
+  using namespace transformer_engine;
+
+  NVTE_CHECK(param < kNVTENumTensorParams, "Invalid NVTETensorParam (got ", static_cast<int>(param),
+             ")");
+  NVTE_CHECK(tensor != nullptr, "Tensor pointer can't be NULL.");
+  auto *t = convertNVTETensor(tensor);
+  NVTE_CHECK(t != nullptr, "Tensor is not allocated.");
+  const auto &attr_size = Tensor::attr_sizes[param];
+  NVTE_CHECK(size_in_bytes >= attr_size,
+             "Buffer is too small for tensor parameter (parameter ", static_cast<int>(param),
+             " needs ", attr_size, " bytes, but buffer has ", size_in_bytes, " bytes)");
+  NVTE_CHECK(buf != nullptr, "Invalid buffer (got NULL)");
+
+  switch (param) {
+    case kNVTERowwiseData:
+      t->data = *reinterpret_cast<const NVTEBasicTensor *>(buf);
+      break;
+    case kNVTEColumnwiseData:
+      t->columnwise_data = *reinterpret_cast<const NVTEBasicTensor *>(buf);
+      break;
+    case kNVTEScale:
+      t->scale = *reinterpret_cast<const NVTEBasicTensor *>(buf);
+      break;
+    case kNVTEAmax:
+      t->amax = *reinterpret_cast<const NVTEBasicTensor *>(buf);
+      break;
+    case kNVTERowwiseScaleInv:
+      t->scale_inv = *reinterpret_cast<const NVTEBasicTensor *>(buf);
+      break;
+    case kNVTEColumnwiseScaleInv:
+      t->columnwise_scale_inv = *reinterpret_cast<const NVTEBasicTensor *>(buf);
+      break;
+    case kNVTEColumnwiseAmax:
+      t->columnwise_amax = *reinterpret_cast<const NVTEBasicTensor *>(buf);
+      break;
+    case kNVTEWithGEMMSwizzledScales:
+      t->with_gemm_swizzled_scales = static_cast<bool>(*reinterpret_cast<const uint8_t *>(buf));
+      break;
+    default:
+      NVTE_ERROR("Unsupported tensor parameter (", static_cast<int>(param), ")");
+  }
+}
+
+void nvte_get_tensor_param_v2(const NVTETensor tensor, NVTETensorParam param, void *buf,
+                              size_t size_in_bytes, size_t *size_written) {
+  using namespace transformer_engine;
+
+  NVTE_CHECK(param < kNVTENumTensorParams, "Invalid NVTETensorParam (got ", static_cast<int>(param),
+             ")");
+  const auto &attr_size = Tensor::attr_sizes[param];
+  if (size_written != nullptr) {
+    *size_written = attr_size;
+  }
+  if (buf == nullptr) {
+    return;
+  }
+  NVTE_CHECK(size_in_bytes >= attr_size,
+             "Buffer is too small for tensor parameter (parameter ", static_cast<int>(param),
+             " needs ", attr_size, " bytes, but buffer has ", size_in_bytes, " bytes)");
+
+  const Tensor *t = convertNVTETensor(tensor);
+  Tensor dummy;
+  if (t == nullptr) {
+    t = &dummy;
+  }
+
+  switch (param) {
+    case kNVTERowwiseData:
+      *reinterpret_cast<NVTEBasicTensor *>(buf) = t->data;
+      break;
+    case kNVTEColumnwiseData:
+      *reinterpret_cast<NVTEBasicTensor *>(buf) = t->columnwise_data;
+      break;
+    case kNVTEScale:
+      *reinterpret_cast<NVTEBasicTensor *>(buf) = t->scale;
+      break;
+    case kNVTEAmax:
+      *reinterpret_cast<NVTEBasicTensor *>(buf) = t->amax;
+      break;
+    case kNVTERowwiseScaleInv:
+      *reinterpret_cast<NVTEBasicTensor *>(buf) = t->scale_inv;
+      break;
+    case kNVTEColumnwiseScaleInv:
+      *reinterpret_cast<NVTEBasicTensor *>(buf) = t->columnwise_scale_inv;
+      break;
+    case kNVTEColumnwiseAmax:
+      *reinterpret_cast<NVTEBasicTensor *>(buf) = t->columnwise_amax;
+      break;
+    case kNVTEWithGEMMSwizzledScales:
+      *reinterpret_cast<uint8_t *>(buf) = static_cast<uint8_t>(t->with_gemm_swizzled_scales);
+      break;
+    default:
+      NVTE_ERROR("Unsupported tensor parameter (", static_cast<int>(param), ")");
+  }
+}
+
 NVTEScalingMode nvte_tensor_scaling_mode(const NVTETensor tensor) {
   if (tensor == nullptr) {
     return NVTE_DELAYED_TENSOR_SCALING;
