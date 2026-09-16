@@ -776,8 +776,8 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
 
   const bool force_algo_66_tile_64x128 =
       std::getenv("NVTE_CUBLASLT_FORCE_ALGO_66_TILE_64X128") != nullptr;
-  constexpr int kMaxHeuristicResults = 32;
-  const int requested_results = force_algo_66_tile_64x128 ? kMaxHeuristicResults : 1;
+  constexpr int kMaxHeuristicResults = 256;
+  const int requested_results = kMaxHeuristicResults;
   std::vector<cublasLtMatmulHeuristicResult_t> heuristic_results(requested_results);
 
   const auto status =
@@ -787,6 +787,33 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
              "Unable to find suitable cuBLAS GEMM algorithm");
   NVTE_CHECK_CUBLAS(status);
   if (returnedResults == 0) NVTE_ERROR("Unable to find any suitable algorithms");
+
+  if (std::getenv("NVTE_CUBLASLT_LOG_ALGO_CONFIG") != nullptr) {
+    std::vector<int32_t> available_algo_ids;
+    int valid_results = 0;
+    for (int candidate = 0; candidate < returnedResults; ++candidate) {
+      const auto &result = heuristic_results[candidate];
+      if (result.state != CUBLAS_STATUS_SUCCESS) {
+        continue;
+      }
+      ++valid_results;
+      int32_t algo_id = -1;
+      NVTE_CHECK_CUBLAS(cublasLtMatmulAlgoConfigGetAttribute(
+          &result.algo, CUBLASLT_ALGO_CONFIG_ID, &algo_id, sizeof(algo_id), nullptr));
+      if (std::find(available_algo_ids.begin(), available_algo_ids.end(), algo_id) ==
+          available_algo_ids.end()) {
+        available_algo_ids.push_back(algo_id);
+      }
+    }
+    std::fprintf(stderr,
+                 "[NVTE][cuBLASLt] m=%d n=%d k=%d returnedResults=%d validResults=%d "
+                 "availableHeuristicAlgoIds=",
+                 m, n, k, returnedResults, valid_results);
+    for (size_t i = 0; i < available_algo_ids.size(); ++i) {
+      std::fprintf(stderr, "%s%d", i == 0 ? "" : ",", available_algo_ids[i]);
+    }
+    std::fprintf(stderr, "\n");
+  }
 
   if (!force_algo_66_tile_64x128) {
     heuristicResult = heuristic_results[0];
@@ -822,7 +849,7 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
     int32_t algo_id = -1;
     NVTE_CHECK_CUBLAS(cublasLtMatmulAlgoConfigGetAttribute(
         &heuristicResult.algo, CUBLASLT_ALGO_CONFIG_ID, &algo_id, sizeof(algo_id), nullptr));
-    if (algo_id == 66 || algo_id == 76) {
+    if (algo_id >= 0) {
       uint32_t tile_id = CUBLASLT_MATMUL_TILE_UNDEFINED;
       uint32_t stages_id = CUBLASLT_MATMUL_STAGES_UNDEFINED;
       uint32_t split_k = 0;
@@ -839,7 +866,7 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
           &heuristicResult.algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reduction_scheme,
           sizeof(reduction_scheme), nullptr));
       std::fprintf(stderr,
-                   "[NVTE][cuBLASLt] m=%d n=%d k=%d algoId=%d tileId=%u stagesId=%u "
+                   "[NVTE][cuBLASLt] selected m=%d n=%d k=%d algoId=%d tileId=%u stagesId=%u "
                    "splitK=%u reductionScheme=%u\n",
                    m, n, k, algo_id, tile_id, stages_id, split_k, reduction_scheme);
     }
