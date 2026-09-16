@@ -13,6 +13,7 @@
 #include <transformer_engine/transformer_engine.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -772,13 +773,44 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
              "cuBLAS workspace pointer must be aligned to 256 bytes, got ",
              new_workspace_alignment);
 
+  const bool block_algo_66 = std::getenv("NVTE_CUBLASLT_BLOCK_ALGO_66") != nullptr;
+  constexpr int kMaxHeuristicResults = 32;
+  const int requested_results = block_algo_66 ? kMaxHeuristicResults : 1;
+  std::vector<cublasLtMatmulHeuristicResult_t> heuristic_results(requested_results);
+
   const auto status =
       cublasLtMatmulAlgoGetHeuristic(handle, operationDesc, Adesc, Bdesc, Cdesc, Ddesc, preference,
-                                     1, &heuristicResult, &returnedResults);
+                                     requested_results, heuristic_results.data(), &returnedResults);
   NVTE_CHECK(status != CUBLAS_STATUS_NOT_SUPPORTED,
              "Unable to find suitable cuBLAS GEMM algorithm");
   NVTE_CHECK_CUBLAS(status);
   if (returnedResults == 0) NVTE_ERROR("Unable to find any suitable algorithms");
+
+  if (!block_algo_66) {
+    heuristicResult = heuristic_results[0];
+  } else {
+    bool found_unblocked_algo = false;
+    for (int candidate = 0; candidate < returnedResults; ++candidate) {
+      const auto &result = heuristic_results[candidate];
+      if (result.state != CUBLAS_STATUS_SUCCESS) {
+        continue;
+      }
+
+      int32_t algo_id = -1;
+      NVTE_CHECK_CUBLAS(cublasLtMatmulAlgoConfigGetAttribute(
+          &result.algo, CUBLASLT_ALGO_CONFIG_ID, &algo_id, sizeof(algo_id), nullptr));
+
+      if (algo_id == 66) {
+        continue;
+      }
+
+      heuristicResult = result;
+      found_unblocked_algo = true;
+      break;
+    }
+    NVTE_CHECK(found_unblocked_algo,
+               "Unable to find a cuBLASLt GEMM algorithm after blocking algo ID 66");
+  }
 
   // D = alpha * (A * B) + beta * C
   NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, operationDesc, alpha, /* alpha */
