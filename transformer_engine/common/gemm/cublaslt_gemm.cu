@@ -13,6 +13,7 @@
 #include <transformer_engine/transformer_engine.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <mutex>
@@ -815,6 +816,33 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
     }
     NVTE_CHECK(found_requested_algo,
                "Unable to find a cuBLASLt GEMM candidate with algo ID 66 and tile 64x128");
+  }
+
+  if (std::getenv("NVTE_CUBLASLT_LOG_ALGO_CONFIG") != nullptr) {
+    int32_t algo_id = -1;
+    NVTE_CHECK_CUBLAS(cublasLtMatmulAlgoConfigGetAttribute(
+        &heuristicResult.algo, CUBLASLT_ALGO_CONFIG_ID, &algo_id, sizeof(algo_id), nullptr));
+    if (algo_id == 66 || algo_id == 76) {
+      uint32_t tile_id = CUBLASLT_MATMUL_TILE_UNDEFINED;
+      uint32_t stages_id = CUBLASLT_MATMUL_STAGES_UNDEFINED;
+      uint32_t split_k = 0;
+      uint32_t reduction_scheme = CUBLASLT_REDUCTION_SCHEME_NONE;
+      NVTE_CHECK_CUBLAS(cublasLtMatmulAlgoConfigGetAttribute(
+          &heuristicResult.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile_id, sizeof(tile_id), nullptr));
+      NVTE_CHECK_CUBLAS(cublasLtMatmulAlgoConfigGetAttribute(
+          &heuristicResult.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages_id, sizeof(stages_id),
+          nullptr));
+      NVTE_CHECK_CUBLAS(cublasLtMatmulAlgoConfigGetAttribute(
+          &heuristicResult.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &split_k, sizeof(split_k),
+          nullptr));
+      NVTE_CHECK_CUBLAS(cublasLtMatmulAlgoConfigGetAttribute(
+          &heuristicResult.algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reduction_scheme,
+          sizeof(reduction_scheme), nullptr));
+      std::fprintf(stderr,
+                   "[NVTE][cuBLASLt] m=%d n=%d k=%d algoId=%d tileId=%u stagesId=%u "
+                   "splitK=%u reductionScheme=%u\n",
+                   m, n, k, algo_id, tile_id, stages_id, split_k, reduction_scheme);
+    }
   }
 
   // D = alpha * (A * B) + beta * C
