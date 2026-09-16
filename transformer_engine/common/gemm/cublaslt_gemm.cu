@@ -773,9 +773,10 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
              "cuBLAS workspace pointer must be aligned to 256 bytes, got ",
              new_workspace_alignment);
 
-  const bool block_algo_66 = std::getenv("NVTE_CUBLASLT_BLOCK_ALGO_66") != nullptr;
+  const bool force_algo_66_tile_64x128 =
+      std::getenv("NVTE_CUBLASLT_FORCE_ALGO_66_TILE_64X128") != nullptr;
   constexpr int kMaxHeuristicResults = 32;
-  const int requested_results = block_algo_66 ? kMaxHeuristicResults : 1;
+  const int requested_results = force_algo_66_tile_64x128 ? kMaxHeuristicResults : 1;
   std::vector<cublasLtMatmulHeuristicResult_t> heuristic_results(requested_results);
 
   const auto status =
@@ -786,10 +787,10 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
   NVTE_CHECK_CUBLAS(status);
   if (returnedResults == 0) NVTE_ERROR("Unable to find any suitable algorithms");
 
-  if (!block_algo_66) {
+  if (!force_algo_66_tile_64x128) {
     heuristicResult = heuristic_results[0];
   } else {
-    bool found_unblocked_algo = false;
+    bool found_requested_algo = false;
     for (int candidate = 0; candidate < returnedResults; ++candidate) {
       const auto &result = heuristic_results[candidate];
       if (result.state != CUBLAS_STATUS_SUCCESS) {
@@ -797,19 +798,23 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
       }
 
       int32_t algo_id = -1;
+      uint32_t tile_id = CUBLASLT_MATMUL_TILE_UNDEFINED;
       NVTE_CHECK_CUBLAS(cublasLtMatmulAlgoConfigGetAttribute(
           &result.algo, CUBLASLT_ALGO_CONFIG_ID, &algo_id, sizeof(algo_id), nullptr));
+      NVTE_CHECK_CUBLAS(cublasLtMatmulAlgoConfigGetAttribute(
+          &result.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile_id, sizeof(tile_id), nullptr));
 
-      if (algo_id == 66) {
+      if (algo_id != 66 ||
+          tile_id != static_cast<uint32_t>(CUBLASLT_MATMUL_TILE_64x128)) {
         continue;
       }
 
       heuristicResult = result;
-      found_unblocked_algo = true;
+      found_requested_algo = true;
       break;
     }
-    NVTE_CHECK(found_unblocked_algo,
-               "Unable to find a cuBLASLt GEMM algorithm after blocking algo ID 66");
+    NVTE_CHECK(found_requested_algo,
+               "Unable to find a cuBLASLt GEMM candidate with algo ID 66 and tile 64x128");
   }
 
   // D = alpha * (A * B) + beta * C
