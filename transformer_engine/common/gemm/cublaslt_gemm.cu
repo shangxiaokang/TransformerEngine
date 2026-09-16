@@ -777,6 +777,11 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
   const bool force_algo_66_tile_64x128 =
       std::getenv("NVTE_CUBLASLT_FORCE_ALGO_66_TILE_64X128") != nullptr;
   constexpr int kMaxHeuristicResults = 256;
+  const char *heuristic_index_env = std::getenv("NVTE_CUBLASLT_HEURISTIC_INDEX");
+  NVTE_CHECK(heuristic_index_env == nullptr || !force_algo_66_tile_64x128,
+             "NVTE_CUBLASLT_HEURISTIC_INDEX and "
+             "NVTE_CUBLASLT_FORCE_ALGO_66_TILE_64X128 cannot be set together");
+
   const int requested_results = kMaxHeuristicResults;
   std::vector<cublasLtMatmulHeuristicResult_t> heuristic_results(requested_results);
 
@@ -815,8 +820,23 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
     std::fprintf(stderr, "\n");
   }
 
-  if (!force_algo_66_tile_64x128) {
-    heuristicResult = heuristic_results[0];
+  int selected_candidate_index = 0;
+  if (heuristic_index_env != nullptr) {
+    char *parse_end = nullptr;
+    const long parsed_index = std::strtol(heuristic_index_env, &parse_end, 10);
+    NVTE_CHECK(parse_end != heuristic_index_env && *parse_end == '\0',
+               "NVTE_CUBLASLT_HEURISTIC_INDEX must be an integer, got ", heuristic_index_env);
+    NVTE_CHECK(parsed_index >= 0 && parsed_index < returnedResults,
+               "NVTE_CUBLASLT_HEURISTIC_INDEX is out of range: ", parsed_index,
+               ", expected [0, ", returnedResults - 1, "]");
+    selected_candidate_index = static_cast<int>(parsed_index);
+    const auto &selected_result = heuristic_results[selected_candidate_index];
+    NVTE_CHECK(selected_result.state == CUBLAS_STATUS_SUCCESS,
+               "cuBLASLt heuristic candidate ", selected_candidate_index,
+               " is not valid, status=", static_cast<int>(selected_result.state));
+    heuristicResult = selected_result;
+  } else if (!force_algo_66_tile_64x128) {
+    heuristicResult = heuristic_results[selected_candidate_index];
   } else {
     bool found_requested_algo = false;
     for (int candidate = 0; candidate < returnedResults; ++candidate) {
@@ -838,6 +858,7 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
       }
 
       heuristicResult = result;
+      selected_candidate_index = candidate;
       found_requested_algo = true;
       break;
     }
@@ -866,9 +887,10 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
           &heuristicResult.algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reduction_scheme,
           sizeof(reduction_scheme), nullptr));
       std::fprintf(stderr,
-                   "[NVTE][cuBLASLt] selected m=%d n=%d k=%d algoId=%d tileId=%u stagesId=%u "
-                   "splitK=%u reductionScheme=%u\n",
-                   m, n, k, algo_id, tile_id, stages_id, split_k, reduction_scheme);
+                   "[NVTE][cuBLASLt] selected candidateIndex=%d m=%d n=%d k=%d algoId=%d "
+                   "tileId=%u stagesId=%u splitK=%u reductionScheme=%u\n",
+                   selected_candidate_index, m, n, k, algo_id, tile_id, stages_id, split_k,
+                   reduction_scheme);
     }
   }
 
