@@ -12,7 +12,6 @@ from pathlib import Path
 import pytest
 import torch
 
-
 # This pure PyTorch reference can be tested without building TE's native extension.
 _QSA_PATH = (
     Path(__file__).resolve().parents[3] / "transformer_engine" / "pytorch" / "attention" / "qsa.py"
@@ -22,6 +21,7 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 qsa_block_sparse_attention = _MODULE.qsa_block_sparse_attention
 qsa_indexed_sdpa_attention = _MODULE.qsa_indexed_sdpa_attention
+qsa_triton_attention = _MODULE.qsa_triton_attention
 
 
 @contextlib.contextmanager
@@ -146,6 +146,27 @@ def test_qsa_indexed_sdpa_matches_dense_forward_backward(
         )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("seq_len", [3, 7, 11])
+@pytest.mark.parametrize("head_dim", [8, 256])
+def test_qsa_triton_matches_dense_forward_backward(dtype, seq_len, head_dim):
+    """The one-launch prototype preserves selection and Q/K/V gradients."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    if _MODULE.triton is None:
+        pytest.skip("Triton is unavailable")
+    with _ieee_cuda_matmul():
+        _compare_qsa_forward_backward(
+            qsa_triton_attention,
+            dtype,
+            seq_len,
+            head_dim,
+            checkpoint_chunks=False,
+            autocast_enabled=False,
+            device_name="cuda",
+        )
+
+
 def _compare_qsa_forward_backward(
     attention_function, dtype, seq_len, head_dim, checkpoint_chunks, autocast_enabled, device_name
 ):
@@ -167,11 +188,18 @@ def _compare_qsa_forward_backward(
     dense_inputs = [tensor.detach().clone().requires_grad_() for tensor in sparse_inputs]
     selected = _selected_blocks(batch, seq_len, budget=3, device=device)
     with torch.autocast(device_type=device_name, dtype=torch.bfloat16, enabled=autocast_enabled):
-        sparse = attention_function(
-            *sparse_inputs, selected, query_chunk_size=3, checkpoint_chunks=checkpoint_chunks
-        )
+        if attention_function is qsa_triton_attention:
+            sparse = attention_function(*sparse_inputs, selected)
+        else:
+            sparse = attention_function(
+                *sparse_inputs, selected, query_chunk_size=3, checkpoint_chunks=checkpoint_chunks
+            )
         dense = _dense_attention(*dense_inputs, selected)
-    forward_tolerance = 1e-5 if dtype == torch.float32 else 2e-2
+    if attention_function is qsa_triton_attention and dtype == torch.float32:
+        # Triton exp is approximate, while the dense reference uses libtorch.
+        forward_tolerance = 2e-4
+    else:
+        forward_tolerance = 1e-5 if dtype == torch.float32 else 2e-2
     torch.testing.assert_close(sparse, dense, atol=forward_tolerance, rtol=forward_tolerance)
 
     output_weight = torch.randn_like(sparse, dtype=torch.float32)
@@ -181,7 +209,9 @@ def _compare_qsa_forward_backward(
     gradient_atol = 1e-5 if dtype == torch.float32 else 4e-2
     gradient_rtol = 1e-5 if dtype == torch.float32 else 3e-2
     for sparse_input, dense_input in zip(sparse_inputs, dense_inputs):
-        if attention_function is qsa_indexed_sdpa_attention and dtype == torch.bfloat16:
+        if attention_function in (qsa_indexed_sdpa_attention, qsa_triton_attention) and (
+            dtype == torch.bfloat16
+        ):
             # SDPA's native BF16 backward reduces over 12 query heads per KV
             # head. Small cancellation residuals need an aggregate comparison.
             difference = sparse_input.grad.float() - dense_input.grad.float()
@@ -190,6 +220,8 @@ def _compare_qsa_forward_backward(
             difference_rms = difference.square().mean().sqrt()
             assert difference_rms / reference_rms < 1e-2
             assert difference.abs().max() / reference_rms < 1e-1
+        elif attention_function is qsa_triton_attention:
+            torch.testing.assert_close(sparse_input.grad, dense_input.grad, atol=3e-4, rtol=3e-4)
         else:
             torch.testing.assert_close(
                 sparse_input.grad, dense_input.grad, atol=gradient_atol, rtol=gradient_rtol
@@ -292,6 +324,27 @@ def test_qsa_empty_selection_has_finite_output_and_gradient(attention_function):
     torch.testing.assert_close(query.grad[:, 3], torch.zeros_like(query.grad[:, 3]))
 
 
+def test_qsa_triton_empty_selection_has_finite_output_and_gradient():
+    """The fused prototype also handles an all-masked complete-block row."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    if _MODULE.triton is None:
+        pytest.skip("Triton is unavailable")
+    query = torch.randn(1, 4, 2, 8, device="cuda", requires_grad=True)
+    key = torch.randn(1, 4, 1, 8, device="cuda", requires_grad=True)
+    value = torch.randn(1, 4, 1, 8, device="cuda", requires_grad=True)
+    selected = torch.empty((1, 4, 0), dtype=torch.int32, device="cuda")
+    with _ieee_cuda_matmul():
+        output = qsa_triton_attention(query, key, value, selected)
+        assert output.isfinite().all()
+        torch.testing.assert_close(output[:, 3], torch.zeros_like(output[:, 3]))
+        output.sum().backward()
+    assert all(
+        tensor.grad is not None and tensor.grad.isfinite().all() for tensor in (query, key, value)
+    )
+    torch.testing.assert_close(query.grad[:, 3], torch.zeros_like(query.grad[:, 3]))
+
+
 @pytest.mark.parametrize(
     "seq_len, query_index, bad_selection",
     [(4, 3, [-2]), (4, 3, [1]), (8, 3, [1]), (7, 6, [1]), (4, 3, [0, 0])],
@@ -305,3 +358,33 @@ def test_qsa_rejects_invalid_block_indices(seq_len, query_index, bad_selection):
     selected[0, query_index] = torch.tensor(bad_selection, dtype=torch.int32)
     with pytest.raises(ValueError):
         qsa_block_sparse_attention(query, key, value, selected)
+
+
+@pytest.mark.parametrize(
+    "attention_function", [qsa_block_sparse_attention, qsa_indexed_sdpa_attention]
+)
+def test_qsa_trusted_indices_can_skip_content_validation(attention_function):
+    """Trusted-selector mode skips duplicate sorting while retaining metadata checks."""
+    query = torch.randn(1, 4, 2, 8)
+    key = torch.randn(1, 4, 1, 8)
+    value = torch.randn(1, 4, 1, 8)
+    selected = torch.full((1, 4, 2), -1, dtype=torch.int32)
+    selected[0, 3] = torch.tensor([0, 0], dtype=torch.int32)
+    output = attention_function(
+        query,
+        key,
+        value,
+        selected,
+        checkpoint_chunks=False,
+        validate_indices=False,
+    )
+    assert output.isfinite().all()
+    with pytest.raises(TypeError):
+        attention_function(
+            query,
+            key,
+            value,
+            selected.float(),
+            checkpoint_chunks=False,
+            validate_indices=False,
+        )

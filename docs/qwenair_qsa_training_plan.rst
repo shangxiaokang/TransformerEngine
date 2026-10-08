@@ -10,10 +10,12 @@ Status
 ------
 
 This is an implementation plan, not a claim that a production QSA kernel is
-available. The two current PyTorch APIs are numerical bring-up paths:
+available. The three current PyTorch APIs are bring-up paths:
 ``qsa_block_sparse_attention`` explicitly computes FP32 scores, while
 ``qsa_indexed_sdpa_attention`` gathers selected K/V and calls PyTorch SDPA.
-Both support autograd for Q, K, and V on unpadded causal self-attention.
+Both support autograd for Q, K, and V on unpadded causal self-attention. The
+experimental ``qsa_triton_attention`` avoids the Python query-chunk loop and
+explicit K/V gather with online FP32 softmax and a recomputing backward.
 
 An isolated wheel build from fork commit ``c4f14012`` succeeded in the same
 B300 PyTorch 25.10 container with CUDA 13.0 and ``NVTE_CUDA_ARCHS=103a``.
@@ -34,6 +36,51 @@ also exited successfully. These jobs validate that the native TE package can
 drive the current small-model training prototype. They do not validate the
 177B target configuration, 262K context, or a production sparse kernel;
 indexed SDPA still selected PyTorch's math backend.
+
+B300 job ``4804025`` passed 13 focused Triton comparisons covering FP32 and
+BF16, head dimensions 8 and 256, three causal-boundary sequence lengths, empty
+selection, and forward plus Q/K/V gradients against the independent dense
+reference. Two-GPU job ``4804080`` wrapped Q/K/V parameters in PyTorch DDP,
+used different valid selections and losses on each rank, and matched all three
+DDP-averaged gradients against separately reduced reference gradients. The
+full standalone QSA file then passed all 201 tests on B300.
+
+The checked-in benchmark measures one complete forward and backward pair after
+two warm-ups, reports the median of three iterations, and reports peak allocated
+bytes above the persistent input allocation. With BF16, batch one, 24:2 GQA,
+head/value dimension 64, 16 selected blocks, and indexed-SDPA query chunks of
+eight, the following B300 results were observed:
+
+* At sequence 512, indexed SDPA took 129.385 ms and 17,531,904 peak bytes with
+  64 Python attention dispatches. Triton took 1.803 ms and 17,351,680 peak
+  bytes with one attention dispatch.
+* At sequence 4,096, indexed SDPA took 1,020.478 ms and 138,675,200 peak bytes
+  with 512 Python attention dispatches. Triton took 10.640 ms and 138,806,272
+  peak bytes with one attention dispatch.
+
+These measurements use ``validate_indices=False`` for indices produced by the
+benchmark's trusted causal constructor. They isolate the attention path and do
+not include selector cost. The geometry is deliberately smaller than the
+target, so the speedups do not predict 262K-context throughput.
+
+Experimental Triton milestone
+-----------------------------
+
+``qsa_triton_attention`` launches one Triton grid for forward and one for
+backward. Each program owns one query head, traverses selected blocks in a
+device loop, reads K/V indirectly, and maintains an online FP32 softmax. The
+backward recomputes probabilities and atomically accumulates shared K/V
+gradients into FP32 buffers. It preserves the existing complete-block and
+partial-tail semantics and supports dimensions through 256.
+
+This removes the most severe host-dispatch and gather-memory behavior from the
+training prototype, but it is not the production kernel described below. GQA
+heads repeat K/V reads, highly popular blocks contend on FP32 atomics, and the
+one-program-per-query mapping has not been tuned for the target budget of 512
+blocks. Packed sequences and context parallelism fail closed. The selector
+still needs a persistent or tiled native implementation. All three APIs keep
+full index validation by default; callers with a trusted selector may set
+``validate_indices=False`` to avoid the synchronizing range and duplicate sort.
 
 On a B300 PCIe GPU with the PyTorch 25.10 container, all 188 standalone QSA
 tests passed, including BF16 forward and backward comparisons with an

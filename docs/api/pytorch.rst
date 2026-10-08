@@ -44,6 +44,15 @@ PyTorch
   GQA keys and values to query-head count internally. The caller must also
   avoid constructing a full ``[B, S, S]`` mask to realize this memory bound.
 
+.. autoapifunction:: transformer_engine.pytorch.qsa_triton_attention
+
+  Experimental single-launch-per-pass Triton path. It reads selected K/V
+  indirectly, uses online FP32 softmax, and recomputes probabilities in
+  backward. Shared K/V gradients use FP32 atomic accumulation. This removes
+  Python query-chunk dispatch and explicit K/V gathers, but remains a prototype:
+  grouped-query heads repeat K/V reads, atomics may contend, and packed sequences
+  and context parallelism are unsupported.
+
   See :doc:`the QwenAir QSA training kernel plan <../qwenair_qsa_training_plan>`
   for the production implementation and verification gates.
 
