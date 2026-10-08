@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
@@ -70,11 +70,7 @@ def _validate_qsa_inputs(
         raise ValueError("selected_key_blocks and query must reside on the same device")
     if not isinstance(query_chunk_size, int) or query_chunk_size < 1:
         raise ValueError("query_chunk_size must be positive")
-    if (
-        query.device.type == "cuda"
-        and query.dtype == torch.float32
-        and _cuda_tf32_matmul_enabled()
-    ):
+    if query.device.type == "cuda" and query.dtype == torch.float32 and _cuda_tf32_matmul_enabled():
         raise RuntimeError(
             "QSA reference requires torch.backends.cuda.matmul.allow_tf32=False "
             "throughout forward and backward for IEEE FP32 score accumulation"
@@ -89,8 +85,7 @@ def _validate_qsa_inputs(
         raise ValueError("selected key block indices are outside the sequence")
     query_positions = torch.arange(seq_len, device=query.device)[None, :, None]
     if torch.any(
-        valid
-        & (selected_key_blocks * _QSA_BLOCK_SIZE + _QSA_BLOCK_SIZE - 1 > query_positions)
+        valid & (selected_key_blocks * _QSA_BLOCK_SIZE + _QSA_BLOCK_SIZE - 1 > query_positions)
     ):
         raise ValueError("selected key blocks must be complete, causal blocks or -1")
     if selected_key_blocks.shape[-1] > 1:
@@ -111,12 +106,14 @@ def _qsa_chunk_positions(
     batch, chunk_size, _ = selected_key_blocks.shape
     offsets = torch.arange(_QSA_BLOCK_SIZE, device=selected_key_blocks.device)
 
-    selected_positions = (
-        selected_key_blocks[..., None] * _QSA_BLOCK_SIZE + offsets
-    ).reshape(batch, chunk_size, -1)
+    selected_positions = (selected_key_blocks[..., None] * _QSA_BLOCK_SIZE + offsets).reshape(
+        batch, chunk_size, -1
+    )
     complete_mask = (
-        selected_key_blocks >= 0
-    )[..., None].expand(-1, -1, -1, _QSA_BLOCK_SIZE).reshape(batch, chunk_size, -1)
+        (selected_key_blocks >= 0)[..., None]
+        .expand(-1, -1, -1, _QSA_BLOCK_SIZE)
+        .reshape(batch, chunk_size, -1)
+    )
 
     # A partial current block is always retained. When it becomes complete, it
     # participates only if the indexer selected it as a complete block.
@@ -124,9 +121,7 @@ def _qsa_chunk_positions(
     tail_mask = ((query_positions + 1) % _QSA_BLOCK_SIZE != 0)[:, None] & (
         tail_positions <= query_positions[:, None]
     )
-    positions = torch.cat(
-        (selected_positions, tail_positions[None].expand(batch, -1, -1)), dim=-1
-    )
+    positions = torch.cat((selected_positions, tail_positions[None].expand(batch, -1, -1)), dim=-1)
     visible = torch.cat((complete_mask, tail_mask[None].expand(batch, -1, -1)), dim=-1)
     safe_positions = positions.clamp(min=0, max=key_sequence_length - 1)
     return safe_positions, visible
@@ -194,9 +189,7 @@ def _qsa_sdpa_chunk(
     has_keys = visible.any(dim=-1)
     safe_visible = visible.clone()
     safe_visible[..., 0] |= ~has_keys
-    mask_rows = safe_visible[:, :, None, None, None, :].expand(
-        -1, -1, num_kv_heads, -1, -1, -1
-    )
+    mask_rows = safe_visible[:, :, None, None, None, :].expand(-1, -1, num_kv_heads, -1, -1, -1)
     mask_rows = mask_rows.reshape(row_count, 1, 1, selected_token_count)
     # Autocast would silently change an FP32 request to BF16 SDPA.
     with torch.autocast(device_type=query.device.type, enabled=False):
@@ -252,8 +245,10 @@ def qsa_block_sparse_attention(
         end = min(start + query_chunk_size, query.shape[1])
         query_positions = torch.arange(start, end, device=query.device)
         args = (query[:, start:end], key, value, selected_key_blocks[:, start:end], query_positions)
-        if checkpoint_chunks and torch.is_grad_enabled() and any(
-            tensor.requires_grad for tensor in (query, key, value)
+        if (
+            checkpoint_chunks
+            and torch.is_grad_enabled()
+            and any(tensor.requires_grad for tensor in (query, key, value))
         ):
             output = checkpoint(
                 _qsa_chunk,
@@ -295,8 +290,10 @@ def qsa_indexed_sdpa_attention(
         end = min(start + query_chunk_size, query.shape[1])
         query_positions = torch.arange(start, end, device=query.device)
         args = (query[:, start:end], key, value, selected_key_blocks[:, start:end], query_positions)
-        if checkpoint_chunks and torch.is_grad_enabled() and any(
-            tensor.requires_grad for tensor in (query, key, value)
+        if (
+            checkpoint_chunks
+            and torch.is_grad_enabled()
+            and any(tensor.requires_grad for tensor in (query, key, value))
         ):
             output = checkpoint(
                 _qsa_sdpa_chunk,

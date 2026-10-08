@@ -79,5 +79,6 @@ Transformer Engine documentation
    api/c/index
    debug
    envvars
+   qwenair_qsa_training_plan
    examples/attention/attention.ipynb
    examples/attention/cp_ag_thd_dpa_jax_deep_dive.ipynb

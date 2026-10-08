@@ -44,6 +44,9 @@ PyTorch
   GQA keys and values to query-head count internally. The caller must also
   avoid constructing a full ``[B, S, S]`` mask to realize this memory bound.
 
+  See :doc:`the QwenAir QSA training kernel plan <../qwenair_qsa_training_plan>`
+  for the production implementation and verification gates.
+
 .. autoapiclass:: transformer_engine.pytorch.GatedDeltaNetAttention(num_attention_heads, kv_channels, **kwargs)
   :members: forward
 

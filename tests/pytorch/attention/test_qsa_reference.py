@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
@@ -15,11 +15,7 @@ import torch
 
 # This pure PyTorch reference can be tested without building TE's native extension.
 _QSA_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "transformer_engine"
-    / "pytorch"
-    / "attention"
-    / "qsa.py"
+    Path(__file__).resolve().parents[3] / "transformer_engine" / "pytorch" / "attention" / "qsa.py"
 )
 _SPEC = importlib.util.spec_from_file_location("qsa_reference_under_test", _QSA_PATH)
 _MODULE = importlib.util.module_from_spec(_SPEC)
@@ -176,9 +172,7 @@ def _compare_qsa_forward_backward(
         )
         dense = _dense_attention(*dense_inputs, selected)
     forward_tolerance = 1e-5 if dtype == torch.float32 else 2e-2
-    torch.testing.assert_close(
-        sparse, dense, atol=forward_tolerance, rtol=forward_tolerance
-    )
+    torch.testing.assert_close(sparse, dense, atol=forward_tolerance, rtol=forward_tolerance)
 
     output_weight = torch.randn_like(sparse, dtype=torch.float32)
     (sparse.float() * output_weight).sum().backward()
@@ -207,9 +201,7 @@ def test_qsa_chunk_selection_size_is_independent_of_sequence_length():
     selected = torch.arange(512, dtype=torch.int32)[None, None, :].expand(1, 8, -1)
     for seq_len in (4096, 131072):
         query_positions = torch.arange(seq_len - 8, seq_len)
-        positions, visible = _MODULE._qsa_chunk_positions(
-            selected, query_positions, seq_len
-        )
+        positions, visible = _MODULE._qsa_chunk_positions(selected, query_positions, seq_len)
         assert positions.shape == visible.shape == (1, 8, 4 * (512 + 1))
         assert positions.numel() == 8 * 2052
         assert positions.max() < seq_len
@@ -295,8 +287,7 @@ def test_qsa_empty_selection_has_finite_output_and_gradient(attention_function):
     torch.testing.assert_close(output[:, 3], torch.zeros_like(output[:, 3]))
     output.sum().backward()
     assert all(
-        tensor.grad is not None and tensor.grad.isfinite().all()
-        for tensor in (query, key, value)
+        tensor.grad is not None and tensor.grad.isfinite().all() for tensor in (query, key, value)
     )
     torch.testing.assert_close(query.grad[:, 3], torch.zeros_like(query.grad[:, 3]))
 
