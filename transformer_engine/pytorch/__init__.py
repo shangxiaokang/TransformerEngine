@@ -36,6 +36,7 @@ from transformer_engine.pytorch.attention import FusedMLAQUpProjFunction, FusedM
 from transformer_engine.pytorch.attention import MultiheadAttention
 from transformer_engine.pytorch.attention import InferenceParams
 from transformer_engine.pytorch.attention import qsa_block_sparse_attention
+from transformer_engine.pytorch.attention import qsa_indexed_sdpa_attention
 from transformer_engine.pytorch.attention import RotaryPositionEmbedding
 from transformer_engine.pytorch.transformer import TransformerLayer
 from transformer_engine.pytorch.permutation import (

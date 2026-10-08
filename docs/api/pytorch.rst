@@ -31,6 +31,19 @@ PyTorch
   attention. Indices are selected independently for each query token. It uses
   FP32 accumulation and chunk recomputation, and is not a production kernel.
 
+.. autoapifunction:: transformer_engine.pytorch.qsa_indexed_sdpa_attention
+
+  Gather-based QwenAir training path using PyTorch scaled dot-product attention.
+  Its actual SDPA backend depends on PyTorch and GPU support for the selection
+  mask. On the B300 PyTorch 25.10 container, the non-null selection mask
+  selects the math backend; forcing FlashAttention rejects that mask.
+  Production performance remains unverified.
+  With ``C`` query tokens per chunk and ``K`` selected four-token blocks, its
+  explicit K/V gather contains at most ``B * C * (4K + 4) * Hkv`` vectors,
+  independent of full sequence length. PyTorch's math SDPA backend may expand
+  GQA keys and values to query-head count internally. The caller must also
+  avoid constructing a full ``[B, S, S]`` mask to realize this memory bound.
+
 .. autoapiclass:: transformer_engine.pytorch.GatedDeltaNetAttention(num_attention_heads, kv_channels, **kwargs)
   :members: forward
 
