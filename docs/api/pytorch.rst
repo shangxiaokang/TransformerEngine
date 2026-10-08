@@ -25,6 +25,12 @@ PyTorch
 .. autoapiclass:: transformer_engine.pytorch.DotProductAttention(num_attention_heads, kv_channels, **kwargs)
   :members: forward, set_context_parallel_group
 
+.. autoapifunction:: transformer_engine.pytorch.qsa_block_sparse_attention
+
+  Differentiable PyTorch correctness reference for QwenAir four-token block-sparse
+  attention. Indices are selected independently for each query token. It uses
+  FP32 accumulation and chunk recomputation, and is not a production kernel.
+
 .. autoapiclass:: transformer_engine.pytorch.GatedDeltaNetAttention(num_attention_heads, kv_channels, **kwargs)
   :members: forward
 

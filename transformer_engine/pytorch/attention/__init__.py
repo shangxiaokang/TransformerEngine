@@ -13,6 +13,7 @@ from .linear_attention import (
 from .fused_mla_q_uproj import FusedMLAQUpProjFunction, FusedMLAQUpProjRopeQuant
 from .multi_head_attention import MultiheadAttention
 from .inference import InferenceParams
+from .qsa import qsa_block_sparse_attention
 from .rope import RotaryPositionEmbedding
 
 __all__ = [
@@ -24,5 +25,6 @@ __all__ = [
     "FusedMLAQUpProjRopeQuant",
     "MultiheadAttention",
     "InferenceParams",
+    "qsa_block_sparse_attention",
     "RotaryPositionEmbedding",
 ]
